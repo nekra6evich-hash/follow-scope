@@ -51,13 +51,25 @@ const words=s=>(s||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g
 function clean(s){return(s||"").replace(/[©®™|]/g," ").replace(/\s+/g," ").trim()}
 function bad(s){const letters=(s.match(/[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё]/g)||[]).length;return letters<3||NOISE.test(s)||/^(кафе|ресторан|музей|парк|магазин|исторический памятник|coffee shop|restaurant|museum|park)$/i.test(s)}
 function signals(text){
-  const lines=uniq(text.split(/\r?\n/).map(clean).filter(x=>x.length>2));
+  const lines=uniq(text.split(/\r?\n/).map(clean).filter(x=>x.length>1));
   const postal=lines.filter(x=>/\b\d{2}-\d{3}\b/.test(x));
-  const streets=lines.filter(x=>/\b(ul\.?|aleja|al\.?|plac|pl\.?|street|road|avenue)\b/i.test(x)||/[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё]+(?:\s+[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё]+)*\s+\d+[A-Za-z]?(?:\/\d+)?/.test(x)).filter(x=>!NOISE.test(x));
-  const addresses=uniq([...streets.flatMap(s=>[s,...postal.map(p=>`${s}, ${p}`)]),...postal]);
-  const names=lines.slice(0,45).map((line,i)=>{let score=0;if(!bad(line))score+=10;if(i<12)score+=7;if(line.length>=3&&line.length<80)score+=3;if(/^[A-ZĄĆĘŁŃÓŚŹŻ0-9 &.-]{3,20}$/.test(line))score+=10;if(/barbakan|барбакан|polin|muzeum|museum|villa|fleur|fontann|фонтан|aldi|kebab|rost/i.test(line))score+=14;if(NOISE.test(line)||/\b\d{2}-\d{3}\b|https?:|\d+\s*(zł|pln|€|\$)/i.test(line))score-=30;return{name:line,score}}).filter(x=>!bad(x.name)).sort((a,b)=>b.score-a.score).slice(0,10).map(x=>x.name);
-  const city=uniq(lines.flatMap(x=>[(x.match(/\b\d{2}-\d{3}\s+([A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё -]{3,})/)||[])[1],(x.match(/\b(Warszawa|Warsaw|Варшава|Konstancin-Jeziorna|Kraków|Gdańsk|Wrocław|Poznań)\b/i)||[])[1]]));if(!city.length)city.push("Warszawa");
-  const c=text.match(/(-?\d{1,2}[.,]\d{4,})\s*[,; ]\s*(-?\d{1,3}[.,]\d{4,})/); const coords=c?{lat:Number(c[1].replace(",",".")),lng:Number(c[2].replace(",","."))}:null;
+  const streets=lines.filter(x=>!NOISE.test(x)&&(/\b(ul\.?|aleja|al\.?|plac|pl\.?|street|road|avenue)\b/i.test(x)||/[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё]+(?:\s+[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё]+)*\s+\d+[A-Za-z]?(?:\/\d+)?/.test(x)));
+  const addresses=uniq([...streets.flatMap(street=>[street,...postal.map(code=>`${street}, ${code}`)]),...postal]);
+  const names=lines.map((line,index)=>{
+    const letters=(line.match(/[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё]/g)||[]).length;
+    let rank=0;
+    if(letters>=3&&!NOISE.test(line))rank+=20;
+    if(index<18)rank+=8;
+    if(line.length>=3&&line.length<=70)rank+=6;
+    if(/^[A-ZĄĆĘŁŃÓŚŹŻ0-9 &.'-]{3,25}$/.test(line))rank+=14;
+    if(/barbakan|барбакан|powstania|восстан|polin|muzeum|museum|villa|fleur|fontann|фонтан|aldi|lidl|bubbella|kebab|rost/i.test(line))rank+=18;
+    if(NOISE.test(line)||/\b\d{2}-\d{3}\b|https?:|\d+\s*(zł|pln|€|\$)/i.test(line))rank-=50;
+    return{name:line,rank};
+  }).filter(x=>x.rank>0).sort((a,b)=>b.rank-a.rank).slice(0,10).map(x=>x.name);
+  const city=uniq(lines.flatMap(x=>[(x.match(/\b\d{2}-\d{3}\s+([A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё -]{3,})/)||[])[1],(x.match(/\b(Warszawa|Warsaw|Варшава|Konstancin-Jeziorna|Kraków|Gdańsk|Wrocław|Poznań)\b/i)||[])[1]]));
+  if(!city.length)city.push("Warszawa");
+  const c=text.match(/(-?\d{1,2}[.,]\d{4,})\s*[,; ]\s*(-?\d{1,3}[.,]\d{4,})/);
+  const coords=c?{lat:Number(c[1].replace(",",".")),lng:Number(c[2].replace(",","."))}:null;
   return{names:uniq(names),addresses,city,coords,isFood:FOOD.test(text)};
 }
 async function search(query,pl=true){const c=new AbortController(),t=setTimeout(()=>c.abort(),7000);try{const u=`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=8&addressdetails=1&namedetails=1&accept-language=pl,en,ru${pl?"&countrycodes=pl":""}&q=${encodeURIComponent(query)}`;const r=await fetch(u,{signal:c.signal,headers:{"Accept-Language":"pl,en,ru"}});return r.ok?r.json():[]}catch{return[]}finally{clearTimeout(t)}}
@@ -67,17 +79,54 @@ function score(h,names,addresses){const hay=words(`${h.display_name||""} ${offic
 async function reverse(lat,lng){const r=await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&addressdetails=1&accept-language=pl,en,ru&lat=${lat}&lon=${lng}`);if(!r.ok)throw Error("Не удалось определить адрес");const h=await r.json(),a=h.address||{};return{address:officialAddress(h),city:a.city||a.town||a.village||a.municipality||""}}
 async function findCandidates(s){
   if(s.coords){const r=await reverse(s.coords.lat,s.coords.lng);return[{...s.coords,name:s.names[0]||r.address,address:r.address,city:r.city,score:999,country:"pl"}]}
-  const names=uniq(s.names).slice(0,8),addresses=uniq(s.addresses.filter(x=>!NOISE.test(x))).slice(0,4),city=s.city[0]||"Warszawa";
-  const titleQueries=uniq(names.flatMap(n=>[`${n}, ${city}, Polska`,`${n}, Polska`,n])).slice(0,12);
-  const refinedQueries=uniq([...names.slice(0,5).flatMap(n=>addresses.map(a=>`${n}, ${a}`)),...addresses.map(a=>`${a}, Polska`)]).slice(0,10);
-  let hits=[];
-  for(const q of titleQueries){const r=await search(q,true);hits.push(...r);await new Promise(x=>setTimeout(x,250))}
-  for(const q of refinedQueries){const r=await search(q,true);hits.push(...r);await new Promise(x=>setTimeout(x,250))}
-  if(!hits.length){for(const q of titleQueries.slice(0,4)){const r=await search(q,false);hits.push(...r);if(r.length)break}}
-  hits=[...new Map(hits.map(h=>[`${h.osm_type}-${h.osm_id}`,h])).values()];
-  return hits.map(h=>{const a=h.address||{},base=score(h,names,addresses),hay=words(h.display_name||"");let extra=0;addresses.forEach(addr=>{const aw=words(addr),m=aw.filter(x=>hay.includes(x)).length;if(aw.length&&m/aw.length>=.5)extra+=90});const foundCity=(a.city||a.town||a.village||a.municipality||"").toLowerCase();if(foundCity&&foundCity.includes(city.toLowerCase()))extra+=35;return{name:officialName(h)||names[0]||h.display_name,address:officialAddress(h),city:a.city||a.town||a.village||a.municipality||"",lat:Number(h.lat),lng:Number(h.lon),score:base+extra,country:a.country_code||""}}).sort((a,b)=>b.score-a.score).slice(0,8);
+  const names=uniq(s.names).slice(0,6),addresses=uniq(s.addresses.filter(x=>!NOISE.test(x))).slice(0,3),city=s.city[0]||"Warszawa";
+  const hits=[];
+  const add=results=>results.forEach(hit=>hits.push(hit));
+  const wait=()=>new Promise(resolve=>setTimeout(resolve,1100));
+
+  for(let i=0;i<Math.min(4,names.length);i++){
+    if(i)await wait();
+    const query=`${names[i]}, ${city}, Polska`;
+    const results=await search(query,true);
+    add(results);
+    const strong=results.some(hit=>{
+      const titleWords=words(names[i]);
+      const resultWords=words(`${officialName(hit)} ${hit.display_name||""}`);
+      return titleWords.length&&titleWords.filter(word=>resultWords.includes(word)).length/Math.max(1,titleWords.length)>=0.5;
+    });
+    if(strong)break;
+  }
+
+  if(addresses[0]){
+    if(hits.length)await wait();
+    add(await search(`${addresses[0]}, Polska`,true));
+  }
+
+  if(!hits.length&&names[0]){
+    add(await search(`${names[0]}, Polska`,false));
+  }
+
+  const uniqueHits=[...new Map(hits.map(hit=>[`${hit.osm_type}-${hit.osm_id}`,hit])).values()];
+  return uniqueHits.map(hit=>{
+    const address=hit.address||{};
+    const title=officialName(hit)||names[0]||hit.display_name;
+    const titleWords=words(names[0]||"");
+    const resultWords=words(`${title} ${hit.display_name||""}`);
+    const titleMatch=titleWords.filter(word=>resultWords.includes(word)).length/Math.max(1,titleWords.length);
+    let rank=titleMatch*160+Number(hit.importance||0)*10;
+    if(address.country_code==="pl")rank+=25;
+    addresses.forEach(source=>{const sourceWords=words(source),matched=sourceWords.filter(word=>resultWords.includes(word)).length;if(sourceWords.length&&matched/sourceWords.length>=0.5)rank+=120;});
+    const foundCity=(address.city||address.town||address.village||address.municipality||"").toLowerCase();
+    if(foundCity&&foundCity.includes(city.toLowerCase()))rank+=35;
+    return{name:title,address:officialAddress(hit),city:address.city||address.town||address.village||address.municipality||"",lat:Number(hit.lat),lng:Number(hit.lon),score:rank,country:address.country_code||""};
+  }).sort((a,b)=>b.score-a.score).slice(0,6);
 }
-async function imageBlob(file,start=0,height=1,max=1000){const b=await createImageBitmap(file),y=Math.round(b.height*start),sh=Math.max(1,Math.round(b.height*height)),scale=Math.min(1,max/b.width),c=document.createElement("canvas");c.width=Math.round(b.width*scale);c.height=Math.round(sh*scale);c.getContext("2d").drawImage(b,0,y,b.width,sh,0,0,c.width,c.height);b.close();return new Promise(r=>c.toBlob(r,"image/jpeg",.82))}
+async function imageBlob(file,start=0,height=1,max=1300){
+  const b=await createImageBitmap(file),y=Math.round(b.height*start),sh=Math.max(1,Math.round(b.height*height)),scale=Math.min(1,max/b.width),c=document.createElement("canvas");
+  c.width=Math.max(1,Math.round(b.width*scale));c.height=Math.max(1,Math.round(sh*scale));
+  const ctx=c.getContext("2d");ctx.filter="contrast(1.2) saturate(.25)";ctx.drawImage(b,0,y,b.width,sh,0,0,c.width,c.height);b.close();
+  return new Promise(resolve=>c.toBlob(resolve,"image/jpeg",.88));
+}
 async function preview(file){const b=await createImageBitmap(file),scale=Math.min(1,480/b.width),c=document.createElement("canvas");c.width=Math.round(b.width*scale);c.height=Math.round(b.height*scale);c.getContext("2d").drawImage(b,0,0,c.width,c.height);b.close();return c.toDataURL("image/jpeg",.58)}
 
 export default function App(){
@@ -93,7 +142,7 @@ export default function App(){
   const del=id=>{setPlaces(a=>a.filter(p=>p.id!==id));if(selected?.id===id)setSelected(null)};
   const route=()=>selected&&window.open(`https://www.google.com/maps/dir/?api=1&destination=${selected.lat},${selected.lng}`,"_blank");
   const useCandidate=c=>{const p={id:Date.now(),name:c.name,address:c.address,city:c.city,note:"",status:pending.status||"want",isFood:pending.isFood,lat:c.lat,lng:c.lng,screenshot:pending.screenshot};setPlaces(a=>[...a,p]);setSelected(p);setCandidateOpen(false);setPending(null);setTab("map")};
-  const processImage=async e=>{const file=e.target.files?.[0];if(!file)return;setProcessing(true);setError("");setProgress(0);try{setStage("Распознаю название");const pv=await preview(file),top=await imageBlob(file,0,.48,1100),bottom=await imageBlob(file,.48,.52,1100);const a=await Tesseract.recognize(top,"eng+pol+rus",{logger:m=>m.status==="recognizing text"&&setProgress(Math.round((m.progress||0)*55))});setStage("Распознаю адрес");const b=await Tesseract.recognize(bottom,"eng+pol+rus",{logger:m=>m.status==="recognizing text"&&setProgress(55+Math.round((m.progress||0)*45))});const sig=signals(`${a.data.text}\n${b.data.text}`);if(!sig.names.length&&!sig.addresses.length&&!sig.coords)throw Error("Не удалось распознать данные");setStage("Ищу по названию");const list=await findCandidates(sig);if(!list.length)throw Error("Место не найдено");setPending({screenshot:pv,isFood:sig.isFood,status:"want"});setCandidates(list);setCandidateOpen(true);setAddOpen(false)}catch(x){setError(x.message||"Ошибка распознавания")}finally{setProcessing(false);e.target.value=""}};
+  const processImage=async e=>{const file=e.target.files?.[0];if(!file)return;setProcessing(true);setError("");setProgress(0);try{setStage("Считываю скриншот");const pv=await preview(file),img=await imageBlob(file,0,1,1300);const result=await Tesseract.recognize(img,"eng+pol+rus",{logger:m=>m.status==="recognizing text"&&setProgress(Math.round((m.progress||0)*100))});const sig=signals(result.data.text);if(!sig.names.length&&!sig.addresses.length&&!sig.coords)throw Error("Не удалось распознать название, адрес или координаты");setStage("Ищу место по названию");const list=await findCandidates(sig);if(!list.length)throw Error("Место не найдено. Распознанное название можно исправить вручную.");setPending({screenshot:pv,isFood:sig.isFood,status:"want",recognizedName:sig.names[0]||"",recognizedAddress:sig.addresses[0]||""});setCandidates(list);setCandidateOpen(true);setAddOpen(false)}catch(x){setError(x.message||"Ошибка распознавания")}finally{setProcessing(false);e.target.value=""}};
   const longPress=async ll=>{setManual({name:"",address:"",note:"",status:"want",isFood:false,lat:ll.lat,lng:ll.lng});setManualOpen(true);try{const r=await reverse(ll.lat,ll.lng);setManual(m=>({...m,address:r.address,city:r.city}))}catch{}};
   const saveManual=()=>{if(!manual.name.trim())return;const p={...manual,id:Date.now()};setPlaces(a=>[...a,p]);setSelected(p);setManualOpen(false)};
   const locate=()=>navigator.geolocation?.getCurrentPosition(({coords})=>{setSelected(null);mapRef.current?.flyTo([coords.latitude,coords.longitude],16)});
