@@ -228,10 +228,20 @@ function extractSignals(text) {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function nominatimSearch(query) {
-  const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&addressdetails=1&accept-language=pl,en,ru&q=${encodeURIComponent(query)}`;
-  const response = await fetch(url, { headers: { "Accept-Language": "pl,en,ru" } });
-  if (!response.ok) return [];
-  return response.json();
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 7000);
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&addressdetails=1&accept-language=pl,en,ru&q=${encodeURIComponent(query)}`;
+    const response = await fetch(url, {
+      headers: { "Accept-Language": "pl,en,ru" },
+      signal: controller.signal,
+    });
+    return response.ok ? response.json() : [];
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function rankResult(hit, names, addresses) {
@@ -267,7 +277,7 @@ async function findPlace(signals) {
 
   const hits = [];
   for (let index = 0; index < queries.length; index += 1) {
-    if (index) await sleep(1050);
+    if (index) await sleep(250);
     const results = await nominatimSearch(queries[index]);
     results.forEach((hit) => hits.push(hit));
     if (results.length && index >= 1) break;
@@ -313,7 +323,7 @@ async function prepareImage(file, startRatio = 0, heightRatio = 1, maxWidth = 16
   return new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.9));
 }
 
-async function makePreview(file, maxWidth = 720) {
+async function makePreview(file, maxWidth = 480) {
   const bitmap = await createImageBitmap(file);
   const scale = Math.min(1, maxWidth / bitmap.width);
   const canvas = document.createElement("canvas");
@@ -321,7 +331,7 @@ async function makePreview(file, maxWidth = 720) {
   canvas.height = Math.max(1, Math.round(bitmap.height * scale));
   canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
   bitmap.close();
-  return canvas.toDataURL("image/jpeg", 0.72);
+  return canvas.toDataURL("image/jpeg", 0.58);
 }
 
 export default function App() {
@@ -373,7 +383,12 @@ export default function App() {
       if (selected && !cleanPlaces.some((place) => place.id === selected.id)) setSelected(null);
       return;
     }
-    localStorage.setItem("followscope-places", JSON.stringify(cleanPlaces));
+    try {
+      localStorage.setItem("followscope-places", JSON.stringify(cleanPlaces));
+    } catch {
+      const withoutScreenshots = cleanPlaces.map(({ screenshot, ...place }) => place);
+      localStorage.setItem("followscope-places", JSON.stringify(withoutScreenshots));
+    }
   }, [places, selected]);
 
   const savedPlaces = useMemo(() => places.filter((place) =>
@@ -392,6 +407,14 @@ export default function App() {
   const palette = dark
     ? { app: "#090b16", chrome: "#111421", panel: "#151927", glass: "rgba(21,25,39,.96)", text: "#f7f8ff", muted: "#aab0c2", line: "rgba(255,255,255,.10)", soft: "rgba(255,255,255,.07)" }
     : { app: "#eef1f7", chrome: "#fff", panel: "#fff", glass: "rgba(255,255,255,.97)", text: "#182033", muted: "#667085", line: "rgba(37,47,72,.11)", soft: "#f2f4f8" };
+
+  const switchTab = (nextTab) => {
+    setSelected(null);
+    setDetailsOpen(false);
+    setManualOpen(false);
+    setAddOpen(false);
+    setTab(nextTab);
+  };
 
   const choose = (place) => {
     setSelected({ ...place });
@@ -479,27 +502,19 @@ export default function App() {
     setError("");
     setFound("");
     try {
-      const preview = await makePreview(file);
-      const fullImage = await prepareImage(file, 0, 1, 1200);
-      setProcessingStage("Распознаю текст");
-      const runOcr = async (image, offset = 0, portion = 1) => Tesseract.recognize(image, "eng+pol+rus", {
+      const preview = await makePreview(file, 480);
+      const analysisImage = await prepareImage(file, 0, 1, 1000);
+      setProcessingStage("Распознаю название и адрес");
+
+      const result = await Tesseract.recognize(analysisImage, "eng+pol+rus", {
         logger: (message) => {
           if (message.status === "recognizing text") {
-            setProgress(Math.min(99, Math.round((offset + (message.progress || 0) * portion) * 100)));
+            setProgress(Math.min(99, Math.round((message.progress || 0) * 100)));
           }
         },
       });
 
-      let combinedText = (await runOcr(fullImage, 0, 0.75)).data.text;
-      let signals = extractSignals(combinedText);
-
-      if (!signals.names.length || (!signals.addresses.length && !signals.coordinates)) {
-        setProcessingStage("Уточняю данные");
-        const focusedImage = await prepareImage(file, signals.names.length ? 0.5 : 0, 0.5, 1200);
-        combinedText += `\n${(await runOcr(focusedImage, 0.75, 0.25)).data.text}`;
-        signals = extractSignals(combinedText);
-      }
-
+      const signals = extractSignals(result.data.text);
       if (!signals.names.length && !signals.addresses.length && !signals.coordinates) {
         throw new Error("Не удалось распознать название, адрес или координаты");
       }
@@ -508,14 +523,20 @@ export default function App() {
       setProcessingStage("Ищу место на карте");
       const geo = await findPlace(signals);
       setProcessingStage("Сохраняю место");
+
       const place = {
         id: Date.now(),
         name: signals.names[0] || geo.displayName || geo.address,
         address: geo.address || signals.addresses[0] || "",
-        note: "", status: "want", category: signals.category,
+        note: "",
+        status: "want",
+        category: signals.category,
         city: geo.city || inferCityFromAddress(geo.address),
-        lat: geo.lat, lng: geo.lng, screenshot: preview,
+        lat: geo.lat,
+        lng: geo.lng,
+        screenshot: preview,
       };
+
       setPlaces((current) => [...current, place]);
       setSelected(place);
       setFound(`${place.name} — ${place.address}`);
@@ -525,6 +546,7 @@ export default function App() {
       setError(e instanceof Error ? e.message : "Не удалось обработать скриншот");
     } finally {
       setProcessing(false);
+      setProgress(0);
       setProcessingStage("Распознаю текст");
       event.target.value = "";
     }
@@ -555,9 +577,9 @@ export default function App() {
           </div> : <div className="h-full overflow-y-auto p-4"><div className="mx-auto max-w-4xl"><div className="flex items-center justify-between"><h2 className="text-[22px] font-bold">Мои места</h2><span style={{ color: palette.muted }}>{filteredPlaces.length}</span></div><div className="mt-4 flex items-center gap-2 rounded-xl px-3" style={{ background: palette.panel }}><Search size={18} /><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Поиск" className="h-11 w-full bg-transparent outline-none" /></div><div className="mt-3 flex gap-2 overflow-x-auto"><FilterButton active={statusFilter === "all"} onClick={() => setStatusFilter("all")}>Все</FilterButton><FilterButton active={statusFilter === "want"} onClick={() => setStatusFilter("want")}>Хочу посетить</FilterButton><FilterButton active={statusFilter === "visited"} onClick={() => setStatusFilter("visited")}>Уже была</FilterButton><FilterButton active={categoryFilter === "food"} onClick={() => setCategoryFilter(categoryFilter === "food" ? "all" : "food")}>Еда</FilterButton><FilterButton active={categoryFilter === "other"} onClick={() => setCategoryFilter(categoryFilter === "other" ? "all" : "other")}>Остальное</FilterButton></div><div className="mt-4 grid gap-3 sm:grid-cols-2">{filteredPlaces.map((place) => <div key={place.id} className="flex items-start gap-3 rounded-[18px] p-4" style={{ background: palette.panel }}><button onClick={() => openDetails(place)} className="flex min-w-0 flex-1 items-start gap-3 text-left">{place.screenshot ? <img src={place.screenshot} alt="" className="h-16 w-16 shrink-0 rounded-xl object-cover" /> : <MapPin size={24} style={{ color: place.status === "visited" ? "#16a085" : "#4f7df3" }} />}<div><p className="font-bold">{place.name}</p><p className="text-sm" style={{ color: palette.muted }}>{place.address}</p>{place.note && <p className="mt-2 text-sm">{place.note}</p>}</div></button><button onClick={() => deletePlace(place.id)} className="grid h-10 w-10 place-items-center rounded-xl text-red-500" style={{ background: palette.soft }}><Trash2 size={18} /></button></div>)}</div></div></div>}
         </main>
 
-        <nav className="relative z-[4000] grid shrink-0 grid-cols-2 gap-2 px-3 pb-[max(8px,env(safe-area-inset-bottom))] pt-2" style={{ background: palette.chrome, borderTop: `1px solid ${palette.line}`, pointerEvents: "auto", touchAction: "manipulation" }}>
-          <button type="button" onClick={() => setTab("map")} onTouchEnd={(event) => { event.preventDefault(); setTab("map"); }} className="flex h-12 items-center justify-center gap-2 rounded-[14px] font-semibold" style={tab === "map" ? { background: gradient, color: "white" } : { color: palette.muted }}><MapIcon size={19} /> Карта</button>
-          <button type="button" onClick={() => setTab("places")} onTouchEnd={(event) => { event.preventDefault(); setSelected(null); setTab("places"); }} className="flex h-12 items-center justify-center gap-2 rounded-[14px] font-semibold" style={tab === "places" ? { background: gradient, color: "white" } : { color: palette.muted }}><Bookmark size={19} /> Мои места</button>
+        <nav className="relative z-[5000] grid shrink-0 grid-cols-2 gap-2 px-3 pb-[max(8px,env(safe-area-inset-bottom))] pt-2" style={{ background: palette.chrome, borderTop: `1px solid ${palette.line}`, pointerEvents: "auto", touchAction: "manipulation" }}>
+          <button type="button" onPointerUp={(event) => { event.preventDefault(); event.stopPropagation(); switchTab("map"); }} className="flex h-12 items-center justify-center gap-2 rounded-[14px] font-semibold" style={tab === "map" ? { background: gradient, color: "white" } : { color: palette.muted }}><MapIcon size={19} /> Карта</button>
+          <button type="button" onPointerUp={(event) => { event.preventDefault(); event.stopPropagation(); switchTab("places"); }} className="flex h-12 items-center justify-center gap-2 rounded-[14px] font-semibold" style={tab === "places" ? { background: gradient, color: "white" } : { color: palette.muted }}><Bookmark size={19} /> Мои места</button>
         </nav>
       </div>
 
@@ -565,7 +587,7 @@ export default function App() {
 
       {manualOpen && <div className="fixed inset-0 z-[3000] grid place-items-end bg-black/60 sm:place-items-center sm:p-4" onMouseDown={() => setManualOpen(false)}><div className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-t-[26px] p-5 sm:rounded-[26px]" style={{ background: palette.panel }} onMouseDown={(e) => e.stopPropagation()}><div className="flex items-center justify-between"><div><h3 className="text-lg font-bold">Новое место</h3><p className="text-sm" style={{ color: palette.muted }}>{manualLoading ? "Определяю адрес…" : "Координаты и адрес заполнены автоматически"}</p></div><button onClick={() => setManualOpen(false)}><X size={20} /></button></div><label className="mt-4 block text-sm font-semibold">Название</label><input autoFocus value={manual.name} onChange={(e) => setManual({ ...manual, name: e.target.value })} placeholder="Название места" className="mt-2 h-11 w-full rounded-xl px-3" style={{ background: palette.soft }} /><label className="mt-3 block text-sm font-semibold">Адрес</label><input value={manual.address} onChange={(e) => setManual({ ...manual, address: e.target.value })} className="mt-2 h-11 w-full rounded-xl px-3" style={{ background: palette.soft }} /><label className="mt-3 block text-sm font-semibold">Категория</label><div className="mt-2 grid grid-cols-2 gap-2"><FilterButton active={manual.category === "food"} onClick={() => setManual({ ...manual, category: "food" })}>Еда</FilterButton><FilterButton active={manual.category === "other"} onClick={() => setManual({ ...manual, category: "other" })}>Остальное</FilterButton></div><label className="mt-3 block text-sm font-semibold">Заметка</label><textarea value={manual.note} onChange={(e) => setManual({ ...manual, note: e.target.value })} className="mt-2 min-h-20 w-full rounded-xl p-3" style={{ background: palette.soft }} /><button disabled={!manual.name.trim() || manualLoading} onClick={saveManualPlace} className="mt-4 h-12 w-full rounded-xl font-semibold text-white disabled:opacity-50" style={{ background: gradient }}>Сохранить место</button></div></div>}
 
-      {addOpen && <div className="fixed inset-0 z-[3000] grid place-items-end bg-black/60 sm:place-items-center sm:p-4" onMouseDown={() => !processing && setAddOpen(false)}><div className="w-full max-w-lg rounded-t-[26px] p-5 sm:rounded-[26px]" style={{ background: palette.panel }} onMouseDown={(e) => e.stopPropagation()}><div className="flex items-center justify-between"><div><h3 className="text-lg font-bold">Добавить место</h3><p className="text-sm" style={{ color: palette.muted }}>Автоматическое распознавание названия, адреса и координат</p></div><button disabled={processing} onClick={() => setAddOpen(false)}><X size={20} /></button></div><input ref={fileRef} type="file" accept="image/*" onChange={handleImage} className="hidden" /><button disabled={processing} onClick={() => fileRef.current?.click()} className="mt-4 flex h-40 w-full flex-col items-center justify-center gap-3 rounded-[18px]" style={{ background: palette.soft }}>{processing ? <><LoaderCircle className="animate-spin" size={30} /><span className="font-semibold">{processingStage}</span><span className="text-sm">{progress}%</span></> : <><Upload size={28} /><span>Выбрать скриншот</span></>}</button>{error && <p className="mt-3 rounded-xl bg-red-50 p-3 text-sm text-red-600">{error}</p>}</div></div>}
+      {addOpen && <div className="fixed inset-x-0 top-0 bottom-[72px] z-[3000] grid place-items-end bg-black/60 sm:inset-0 sm:place-items-center sm:p-4" onMouseDown={() => !processing && setAddOpen(false)}><div className="w-full max-w-lg rounded-t-[26px] p-5 sm:rounded-[26px]" style={{ background: palette.panel }} onMouseDown={(e) => e.stopPropagation()}><div className="flex items-center justify-between"><div><h3 className="text-lg font-bold">Добавить место</h3><p className="text-sm" style={{ color: palette.muted }}>Автоматическое распознавание названия, адреса и координат</p></div><button disabled={processing} onClick={() => setAddOpen(false)}><X size={20} /></button></div><input ref={fileRef} type="file" accept="image/*" onChange={handleImage} className="hidden" /><button disabled={processing} onClick={() => fileRef.current?.click()} className="mt-4 flex h-40 w-full flex-col items-center justify-center gap-3 rounded-[18px]" style={{ background: palette.soft }}>{processing ? <><LoaderCircle className="animate-spin" size={30} /><span className="font-semibold">{processingStage}</span><span className="text-sm">{progress}%</span></> : <><Upload size={28} /><span>Выбрать скриншот</span></>}</button>{error && <p className="mt-3 rounded-xl bg-red-50 p-3 text-sm text-red-600">{error}</p>}</div></div>}
     </div>
   );
 }
