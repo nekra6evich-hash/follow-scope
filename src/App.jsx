@@ -6,7 +6,7 @@ import "leaflet/dist/leaflet.css";
 import {
   MapPin, Plus, Sun, Moon, Navigation, LocateFixed, Map as MapIcon,
   Bookmark, ChevronRight, X, Upload, Copy, Trash2, LoaderCircle,
-  Save, Search, Utensils, Download, FileUp, Check
+  Save, Search, Utensils, Download, FileUp, Check, Camera
 } from "lucide-react";
 
 const seedPlaces = [
@@ -49,13 +49,13 @@ function LongPress({ onLongPress }) {
 const uniq=a=>[...new Set(a.filter(Boolean).map(x=>x.trim()).filter(Boolean))];
 const words=s=>(s||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/[^0-9a-ząćęłńóśźżа-яё ]/gi," ").split(/\s+/).filter(x=>x.length>2);
 function clean(s){return(s||"").replace(/[©®™|]/g," ").replace(/\s+/g," ").trim()}
-function bad(s){const w=words(s);const letters=(s.match(/[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё]/g)||[]).length;return !w.length||letters<4||NOISE.test(s)||/^(кафе|ресторан|музей|парк|магазин|исторический памятник|coffee shop|restaurant|museum|park)$/i.test(s)}
+function bad(s){const letters=(s.match(/[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё]/g)||[]).length;return letters<3||NOISE.test(s)||/^(кафе|ресторан|музей|парк|магазин|исторический памятник|coffee shop|restaurant|museum|park)$/i.test(s)}
 function signals(text){
   const lines=uniq(text.split(/\r?\n/).map(clean).filter(x=>x.length>2));
   const postal=lines.filter(x=>/\b\d{2}-\d{3}\b/.test(x));
   const streets=lines.filter(x=>/\b(ul\.?|aleja|al\.?|plac|pl\.?|street|road|avenue)\b/i.test(x)||/[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё]+(?:\s+[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё]+)*\s+\d+[A-Za-z]?(?:\/\d+)?/.test(x)).filter(x=>!NOISE.test(x));
   const addresses=uniq([...streets.flatMap(s=>[s,...postal.map(p=>`${s}, ${p}`)]),...postal]);
-  const names=lines.slice(0,35).map((line,i)=>{let score=0;if(!bad(line))score+=10;if(i<10)score+=7;if(line.length>=4&&line.length<80)score+=3;if(/barbakan|барбакан|polin|muzeum|museum|villa|fleur|fontann|фонтан|aldi|kebab/i.test(line))score+=12;if(NOISE.test(line)||/\b\d{2}-\d{3}\b|https?:|\d+\s*(zł|pln|€|\$)/i.test(line))score-=30;return{name:line,score}}).filter(x=>!bad(x.name)).sort((a,b)=>b.score-a.score).slice(0,8).map(x=>x.name);
+  const names=lines.slice(0,45).map((line,i)=>{let score=0;if(!bad(line))score+=10;if(i<12)score+=7;if(line.length>=3&&line.length<80)score+=3;if(/^[A-ZĄĆĘŁŃÓŚŹŻ0-9 &.-]{3,20}$/.test(line))score+=10;if(/barbakan|барбакан|polin|muzeum|museum|villa|fleur|fontann|фонтан|aldi|kebab|rost/i.test(line))score+=14;if(NOISE.test(line)||/\b\d{2}-\d{3}\b|https?:|\d+\s*(zł|pln|€|\$)/i.test(line))score-=30;return{name:line,score}}).filter(x=>!bad(x.name)).sort((a,b)=>b.score-a.score).slice(0,10).map(x=>x.name);
   const city=uniq(lines.flatMap(x=>[(x.match(/\b\d{2}-\d{3}\s+([A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё -]{3,})/)||[])[1],(x.match(/\b(Warszawa|Warsaw|Варшава|Konstancin-Jeziorna|Kraków|Gdańsk|Wrocław|Poznań)\b/i)||[])[1]]));if(!city.length)city.push("Warszawa");
   const c=text.match(/(-?\d{1,2}[.,]\d{4,})\s*[,; ]\s*(-?\d{1,3}[.,]\d{4,})/); const coords=c?{lat:Number(c[1].replace(",",".")),lng:Number(c[2].replace(",","."))}:null;
   return{names:uniq(names),addresses,city,coords,isFood:FOOD.test(text)};
@@ -66,18 +66,40 @@ function officialAddress(h){const a=h.address||{};const line=[[a.road||a.pedestr
 function score(h,names,addresses){const hay=words(`${h.display_name||""} ${officialName(h)}`);let s=Number(h.importance||0)*5;if(h.address?.country_code==="pl")s+=100;names.forEach((n,i)=>{const w=words(n),m=w.filter(x=>hay.includes(x)).length;s+=m*(i?4:9);if(w.length&&m/w.length>=.6)s+=30});addresses.forEach(a=>s+=words(a).filter(x=>hay.includes(x)).length*4);return s}
 async function reverse(lat,lng){const r=await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&addressdetails=1&accept-language=pl,en,ru&lat=${lat}&lon=${lng}`);if(!r.ok)throw Error("Не удалось определить адрес");const h=await r.json(),a=h.address||{};return{address:officialAddress(h),city:a.city||a.town||a.village||a.municipality||""}}
 async function findCandidates(s){
-  if(s.coords){const r=await reverse(s.coords.lat,s.coords.lng);return[{...s.coords,name:s.names[0]||r.address,address:r.address,city:r.city,score:999}]}
-  const goodNames=s.names.filter(x=>!bad(x)).slice(0,5),goodAddr=s.addresses.slice(0,3),city=s.city[0]||"Warszawa";
-  const queries=uniq([...goodNames.flatMap(n=>[`${n}, Polska`,`${n}, ${city}, Polska`,goodAddr[0]?`${n}, ${goodAddr[0]}`:""]),...goodAddr.map(a=>`${a}, Polska`)]).slice(0,10);
-  let hits=[];for(let i=0;i<queries.length;i++){const r=await search(queries[i],true);hits.push(...r);if(r.length&&i>=1)break;if(i)await new Promise(x=>setTimeout(x,250))}if(!hits.length)for(let i=0;i<Math.min(3,queries.length);i++){const r=await search(queries[i],false);hits.push(...r);if(r.length)break}
-  hits=[...new Map(hits.map(h=>[`${h.osm_type}-${h.osm_id}`,h])).values()];return hits.map(h=>{const a=h.address||{};return{name:officialName(h)||goodNames[0]||h.display_name,address:officialAddress(h),city:a.city||a.town||a.village||a.municipality||"",lat:Number(h.lat),lng:Number(h.lon),score:score(h,goodNames,goodAddr),country:a.country_code||""}}).sort((a,b)=>b.score-a.score).slice(0,5);
+  if(s.coords){const r=await reverse(s.coords.lat,s.coords.lng);return[{...s.coords,name:s.names[0]||r.address,address:r.address,city:r.city,score:999,country:"pl"}]}
+  const goodNames=uniq(s.names.filter(x=>!bad(x))).slice(0,6),goodAddr=uniq(s.addresses.filter(x=>!NOISE.test(x))).slice(0,3),city=s.city[0]||"Warszawa";
+  const queries=uniq([
+    ...goodNames.flatMap(n=>[
+      `${n}, ${city}, Polska`,
+      goodAddr[0]?`${n}, ${goodAddr[0]}`:"",
+      `${n}, Polska`,
+    ]),
+    ...goodAddr.map(a=>`${a}, Polska`),
+  ]).slice(0,9);
+  let hits=[];
+  for(let i=0;i<queries.length;i++){
+    const r=await search(queries[i],true);
+    hits.push(...r);
+    if(i<queries.length-1)await new Promise(x=>setTimeout(x,300));
+  }
+  if(!hits.length){
+    for(let i=0;i<Math.min(4,queries.length);i++){
+      const r=await search(queries[i],false);hits.push(...r);if(r.length)break;
+    }
+  }
+  hits=[...new Map(hits.map(h=>[`${h.osm_type}-${h.osm_id}`,h])).values()];
+  return hits.map(h=>{const a=h.address||{},base=score(h,goodNames,goodAddr),hay=words(h.display_name||"");let extra=0;
+    goodAddr.forEach(addr=>{const aw=words(addr);const matched=aw.filter(x=>hay.includes(x)).length;if(aw.length&&matched/aw.length>=.5)extra+=80;});
+    if((a.city||a.town||a.village||a.municipality||"").toLowerCase().includes(city.toLowerCase()))extra+=30;
+    return{name:officialName(h)||goodNames[0]||h.display_name,address:officialAddress(h),city:a.city||a.town||a.village||a.municipality||"",lat:Number(h.lat),lng:Number(h.lon),score:base+extra,country:a.country_code||""};
+  }).sort((a,b)=>b.score-a.score).slice(0,8);
 }
 async function imageBlob(file,start=0,height=1,max=1000){const b=await createImageBitmap(file),y=Math.round(b.height*start),sh=Math.max(1,Math.round(b.height*height)),scale=Math.min(1,max/b.width),c=document.createElement("canvas");c.width=Math.round(b.width*scale);c.height=Math.round(sh*scale);c.getContext("2d").drawImage(b,0,y,b.width,sh,0,0,c.width,c.height);b.close();return new Promise(r=>c.toBlob(r,"image/jpeg",.82))}
 async function preview(file){const b=await createImageBitmap(file),scale=Math.min(1,480/b.width),c=document.createElement("canvas");c.width=Math.round(b.width*scale);c.height=Math.round(b.height*scale);c.getContext("2d").drawImage(b,0,0,c.width,c.height);b.close();return c.toDataURL("image/jpeg",.58)}
 
 export default function App(){
   const [dark,setDark]=useState(false),[tab,setTab]=useState("map"),[places,setPlaces]=useState(()=>{try{return (JSON.parse(localStorage.getItem("places-data"))||seedPlaces).map(p=>({...p,isFood:p.isFood??p.category==="food"}))}catch{return seedPlaces}}),[selected,setSelected]=useState(null),[editOpen,setEditOpen]=useState(false),[addOpen,setAddOpen]=useState(false),[manualOpen,setManualOpen]=useState(false),[processing,setProcessing]=useState(false),[stage,setStage]=useState(""),[progress,setProgress]=useState(0),[error,setError]=useState(""),[candidates,setCandidates]=useState([]),[candidateOpen,setCandidateOpen]=useState(false),[pending,setPending]=useState(null),[searchText,setSearchText]=useState(""),[statusFilter,setStatusFilter]=useState("all"),[foodOnly,setFoodOnly]=useState(false),[edit,setEdit]=useState({}),[manual,setManual]=useState({name:"",address:"",note:"",status:"want",isFood:false,lat:0,lng:0});
-  const fileRef=useRef(null),importRef=useRef(null),mapRef=useRef(null);
+  const fileRef=useRef(null),cameraRef=useRef(null),importRef=useRef(null),mapRef=useRef(null);
   useEffect(()=>{try{localStorage.setItem("places-data",JSON.stringify(places))}catch{localStorage.setItem("places-data",JSON.stringify(places.map(({screenshot,...p})=>p))) }},[places]);
   const filtered=useMemo(()=>places.filter(p=>(statusFilter==="all"||p.status===statusFilter)&&(!foodOnly||p.isFood)&&`${p.name} ${p.address} ${p.note}`.toLowerCase().includes(searchText.toLowerCase())),[places,statusFilter,foodOnly,searchText]);
   const pal=dark?{app:"#090b16",chrome:"#111421",panel:"#151927",glass:"#151927f5",text:"#f7f8ff",muted:"#aab0c2",line:"#ffffff1a",soft:"#ffffff12"}:{app:"#eef1f7",chrome:"#fff",panel:"#fff",glass:"#fffffff5",text:"#182033",muted:"#667085",line:"#252f481c",soft:"#f2f4f8"};
@@ -104,7 +126,7 @@ export default function App(){
   </div>
   {editOpen&&selected&&<Modal pal={pal} close={()=>setEditOpen(false)} title="Редактировать место"><PlaceForm data={edit} setData={setEdit} pal={pal}/><div className="mt-3 flex items-center justify-between rounded-xl p-3" style={{background:pal.soft}}><span>{Number(selected.lat).toFixed(6)}, {Number(selected.lng).toFixed(6)}</span><button onClick={()=>navigator.clipboard?.writeText(`${selected.lat}, ${selected.lng}`)}><Copy size={17}/></button></div><div className="mt-4 grid grid-cols-[1fr_auto] gap-2"><Primary click={saveEdit}><Save size={18}/>Сохранить</Primary><button onClick={()=>{del(selected.id);setEditOpen(false)}} className="grid h-12 w-12 place-items-center rounded-xl text-red-500" style={{background:pal.soft}}><Trash2/></button></div></Modal>}
   {manualOpen&&<Modal pal={pal} close={()=>setManualOpen(false)} title="Новое место"><PlaceForm data={manual} setData={setManual} pal={pal}/><Primary click={saveManual} disabled={!manual.name.trim()}>Сохранить место</Primary></Modal>}
-  {addOpen&&<Modal pal={pal} close={()=>!processing&&setAddOpen(false)} title="Добавить место"><input ref={fileRef} type="file" accept="image/*" onChange={processImage} className="hidden"/><button disabled={processing} onClick={()=>fileRef.current?.click()} className="flex h-40 w-full flex-col items-center justify-center gap-3 rounded-2xl" style={{background:pal.soft}}>{processing?<><LoaderCircle className="animate-spin"/><b>{stage}</b><span>{progress}%</span></>:<><Upload/><b>Выбрать скриншот</b></>}</button>{error&&<p className="mt-3 rounded-xl bg-red-50 p-3 text-red-600">{error}</p>}</Modal>}
+  {addOpen&&<Modal pal={pal} close={()=>!processing&&setAddOpen(false)} title="Добавить место"><input ref={fileRef} type="file" accept="image/*" onChange={processImage} className="hidden"/><input ref={cameraRef} type="file" accept="image/*" capture="environment" onChange={processImage} className="hidden"/>{processing?<div className="flex h-44 w-full flex-col items-center justify-center gap-3 rounded-2xl" style={{background:pal.soft}}><LoaderCircle className="animate-spin"/><b>{stage}</b><span>{progress}%</span></div>:<div className="grid grid-cols-2 gap-3"><button onClick={()=>fileRef.current?.click()} className="flex h-40 flex-col items-center justify-center gap-3 rounded-2xl" style={{background:pal.soft}}><Upload size={30}/><b className="text-center">Выбрать скриншот</b></button><button onClick={()=>cameraRef.current?.click()} className="flex h-40 flex-col items-center justify-center gap-3 rounded-2xl" style={{background:pal.soft}}><Camera size={30}/><b className="text-center">Сделать фото</b></button></div>}{error&&<p className="mt-3 rounded-xl bg-red-50 p-3 text-red-600">{error}</p>}</Modal>}
   {candidateOpen&&<Modal pal={pal} close={()=>setCandidateOpen(false)} title="Выберите найденное место"><p className="mb-3 text-sm" style={{color:pal.muted}}>Сначала показаны наиболее подходящие варианты в Польше.</p><div className="grid gap-2">{candidates.map((c,i)=><button key={`${c.lat}-${c.lng}-${i}`} onClick={()=>useCandidate(c)} className="rounded-xl p-3 text-left" style={{background:i===0?"#ede9fe":pal.soft,border:i===0?"2px solid #7c3aed":"1px solid transparent"}}><div className="flex justify-between gap-2"><b>{c.name}</b>{i===0&&<Check size={18} className="text-violet-600"/>}</div><p className="mt-1 text-sm" style={{color:pal.muted}}>{c.address}</p>{c.country==="pl"&&<span className="mt-1 inline-block text-xs font-bold text-violet-600">Польша</span>}</button>)}</div></Modal>}
   </div>
 }
