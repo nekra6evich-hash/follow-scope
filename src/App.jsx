@@ -67,32 +67,15 @@ function score(h,names,addresses){const hay=words(`${h.display_name||""} ${offic
 async function reverse(lat,lng){const r=await fetch(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&addressdetails=1&accept-language=pl,en,ru&lat=${lat}&lon=${lng}`);if(!r.ok)throw Error("Не удалось определить адрес");const h=await r.json(),a=h.address||{};return{address:officialAddress(h),city:a.city||a.town||a.village||a.municipality||""}}
 async function findCandidates(s){
   if(s.coords){const r=await reverse(s.coords.lat,s.coords.lng);return[{...s.coords,name:s.names[0]||r.address,address:r.address,city:r.city,score:999,country:"pl"}]}
-  const goodNames=uniq(s.names.filter(x=>!bad(x))).slice(0,6),goodAddr=uniq(s.addresses.filter(x=>!NOISE.test(x))).slice(0,3),city=s.city[0]||"Warszawa";
-  const queries=uniq([
-    ...goodNames.flatMap(n=>[
-      `${n}, ${city}, Polska`,
-      goodAddr[0]?`${n}, ${goodAddr[0]}`:"",
-      `${n}, Polska`,
-    ]),
-    ...goodAddr.map(a=>`${a}, Polska`),
-  ]).slice(0,9);
+  const names=uniq(s.names).slice(0,8),addresses=uniq(s.addresses.filter(x=>!NOISE.test(x))).slice(0,4),city=s.city[0]||"Warszawa";
+  const titleQueries=uniq(names.flatMap(n=>[`${n}, ${city}, Polska`,`${n}, Polska`,n])).slice(0,12);
+  const refinedQueries=uniq([...names.slice(0,5).flatMap(n=>addresses.map(a=>`${n}, ${a}`)),...addresses.map(a=>`${a}, Polska`)]).slice(0,10);
   let hits=[];
-  for(let i=0;i<queries.length;i++){
-    const r=await search(queries[i],true);
-    hits.push(...r);
-    if(i<queries.length-1)await new Promise(x=>setTimeout(x,300));
-  }
-  if(!hits.length){
-    for(let i=0;i<Math.min(4,queries.length);i++){
-      const r=await search(queries[i],false);hits.push(...r);if(r.length)break;
-    }
-  }
+  for(const q of titleQueries){const r=await search(q,true);hits.push(...r);await new Promise(x=>setTimeout(x,250))}
+  for(const q of refinedQueries){const r=await search(q,true);hits.push(...r);await new Promise(x=>setTimeout(x,250))}
+  if(!hits.length){for(const q of titleQueries.slice(0,4)){const r=await search(q,false);hits.push(...r);if(r.length)break}}
   hits=[...new Map(hits.map(h=>[`${h.osm_type}-${h.osm_id}`,h])).values()];
-  return hits.map(h=>{const a=h.address||{},base=score(h,goodNames,goodAddr),hay=words(h.display_name||"");let extra=0;
-    goodAddr.forEach(addr=>{const aw=words(addr);const matched=aw.filter(x=>hay.includes(x)).length;if(aw.length&&matched/aw.length>=.5)extra+=80;});
-    if((a.city||a.town||a.village||a.municipality||"").toLowerCase().includes(city.toLowerCase()))extra+=30;
-    return{name:officialName(h)||goodNames[0]||h.display_name,address:officialAddress(h),city:a.city||a.town||a.village||a.municipality||"",lat:Number(h.lat),lng:Number(h.lon),score:base+extra,country:a.country_code||""};
-  }).sort((a,b)=>b.score-a.score).slice(0,8);
+  return hits.map(h=>{const a=h.address||{},base=score(h,names,addresses),hay=words(h.display_name||"");let extra=0;addresses.forEach(addr=>{const aw=words(addr),m=aw.filter(x=>hay.includes(x)).length;if(aw.length&&m/aw.length>=.5)extra+=90});const foundCity=(a.city||a.town||a.village||a.municipality||"").toLowerCase();if(foundCity&&foundCity.includes(city.toLowerCase()))extra+=35;return{name:officialName(h)||names[0]||h.display_name,address:officialAddress(h),city:a.city||a.town||a.village||a.municipality||"",lat:Number(h.lat),lng:Number(h.lon),score:base+extra,country:a.country_code||""}}).sort((a,b)=>b.score-a.score).slice(0,8);
 }
 async function imageBlob(file,start=0,height=1,max=1000){const b=await createImageBitmap(file),y=Math.round(b.height*start),sh=Math.max(1,Math.round(b.height*height)),scale=Math.min(1,max/b.width),c=document.createElement("canvas");c.width=Math.round(b.width*scale);c.height=Math.round(sh*scale);c.getContext("2d").drawImage(b,0,y,b.width,sh,0,0,c.width,c.height);b.close();return new Promise(r=>c.toBlob(r,"image/jpeg",.82))}
 async function preview(file){const b=await createImageBitmap(file),scale=Math.min(1,480/b.width),c=document.createElement("canvas");c.width=Math.round(b.width*scale);c.height=Math.round(b.height*scale);c.getContext("2d").drawImage(b,0,0,c.width,c.height);b.close();return c.toDataURL("image/jpeg",.58)}
@@ -110,7 +93,7 @@ export default function App(){
   const del=id=>{setPlaces(a=>a.filter(p=>p.id!==id));if(selected?.id===id)setSelected(null)};
   const route=()=>selected&&window.open(`https://www.google.com/maps/dir/?api=1&destination=${selected.lat},${selected.lng}`,"_blank");
   const useCandidate=c=>{const p={id:Date.now(),name:c.name,address:c.address,city:c.city,note:"",status:pending.status||"want",isFood:pending.isFood,lat:c.lat,lng:c.lng,screenshot:pending.screenshot};setPlaces(a=>[...a,p]);setSelected(p);setCandidateOpen(false);setPending(null);setTab("map")};
-  const processImage=async e=>{const file=e.target.files?.[0];if(!file)return;setProcessing(true);setError("");setProgress(0);try{setStage("Распознаю название и адрес");const pv=await preview(file),main=await imageBlob(file,0,1,1000),result=await Tesseract.recognize(main,"eng+pol+rus",{logger:m=>m.status==="recognizing text"&&setProgress(Math.round((m.progress||0)*100))});let sig=signals(result.data.text);if(!sig.names.length||(!sig.addresses.length&&!sig.coords)){setStage("Уточняю данные");const top=await imageBlob(file,0,.42,1000),bottom=await imageBlob(file,.55,.45,1000);const a=await Tesseract.recognize(top,"eng+pol+rus"),b=await Tesseract.recognize(bottom,"eng+pol+rus");sig=signals(`${result.data.text}\n${a.data.text}\n${b.data.text}`)}if(!sig.names.length&&!sig.addresses.length&&!sig.coords)throw Error("Не удалось распознать данные");setStage("Ищу варианты в Польше");const list=await findCandidates(sig);if(!list.length)throw Error("Место не найдено");setPending({screenshot:pv,isFood:sig.isFood,status:"want"});setCandidates(list);setCandidateOpen(true);setAddOpen(false)}catch(x){setError(x.message||"Ошибка распознавания")}finally{setProcessing(false);e.target.value=""}};
+  const processImage=async e=>{const file=e.target.files?.[0];if(!file)return;setProcessing(true);setError("");setProgress(0);try{setStage("Распознаю название");const pv=await preview(file),top=await imageBlob(file,0,.48,1100),bottom=await imageBlob(file,.48,.52,1100);const a=await Tesseract.recognize(top,"eng+pol+rus",{logger:m=>m.status==="recognizing text"&&setProgress(Math.round((m.progress||0)*55))});setStage("Распознаю адрес");const b=await Tesseract.recognize(bottom,"eng+pol+rus",{logger:m=>m.status==="recognizing text"&&setProgress(55+Math.round((m.progress||0)*45))});const sig=signals(`${a.data.text}\n${b.data.text}`);if(!sig.names.length&&!sig.addresses.length&&!sig.coords)throw Error("Не удалось распознать данные");setStage("Ищу по названию");const list=await findCandidates(sig);if(!list.length)throw Error("Место не найдено");setPending({screenshot:pv,isFood:sig.isFood,status:"want"});setCandidates(list);setCandidateOpen(true);setAddOpen(false)}catch(x){setError(x.message||"Ошибка распознавания")}finally{setProcessing(false);e.target.value=""}};
   const longPress=async ll=>{setManual({name:"",address:"",note:"",status:"want",isFood:false,lat:ll.lat,lng:ll.lng});setManualOpen(true);try{const r=await reverse(ll.lat,ll.lng);setManual(m=>({...m,address:r.address,city:r.city}))}catch{}};
   const saveManual=()=>{if(!manual.name.trim())return;const p={...manual,id:Date.now()};setPlaces(a=>[...a,p]);setSelected(p);setManualOpen(false)};
   const locate=()=>navigator.geolocation?.getCurrentPosition(({coords})=>{setSelected(null);mapRef.current?.flyTo([coords.latitude,coords.longitude],16)});
