@@ -254,21 +254,23 @@ async function findPlace(signals) {
     return { ...signals.coordinates, city: reverse.city, address: reverse.address, displayName: signals.names[0] || reverse.address };
   }
 
+  const mainName = signals.names[0] || "";
+  const mainAddress = signals.addresses[0] || "";
+  const mainCity = signals.cityHints[0] || "Warszawa";
   const queries = unique([
-    ...signals.names.slice(0, 4).flatMap((name) => [
-      ...signals.addresses.slice(0, 3).map((address) => `${name}, ${address}`),
-      ...signals.cityHints.slice(0, 2).map((city) => `${name}, ${city}`),
-      name,
-    ]),
-    ...signals.addresses.slice(0, 4),
-  ]).slice(0, 12);
+    mainName && mainAddress ? `${mainName}, ${mainAddress}` : "",
+    mainName ? `${mainName}, ${mainCity}` : "",
+    mainName,
+    mainAddress,
+    signals.names[1] ? `${signals.names[1]}, ${mainCity}` : "",
+  ]).slice(0, 5);
 
   const hits = [];
   for (let index = 0; index < queries.length; index += 1) {
     if (index) await sleep(1050);
     const results = await nominatimSearch(queries[index]);
     results.forEach((hit) => hits.push(hit));
-    if (hits.length && index >= 2) break;
+    if (results.length && index >= 1) break;
   }
   if (!hits.length) throw new Error("Место не найдено автоматически");
   const best = hits.sort((a, b) => rankResult(b, signals.names, signals.addresses) - rankResult(a, signals.names, signals.addresses))[0];
@@ -276,8 +278,8 @@ async function findPlace(signals) {
   return {
     lat: Number(best.lat), lng: Number(best.lon),
     city: data.city || data.town || data.village || data.municipality || inferCityFromAddress(best.display_name || ""),
-    address: signals.addresses[0] || best.display_name || "",
-    displayName: signals.names[0] || best.name || best.display_name || "Место",
+    address: mainAddress || best.display_name || "",
+    displayName: mainName || best.name || best.display_name || "Место",
   };
 }
 
@@ -311,6 +313,17 @@ async function prepareImage(file, startRatio = 0, heightRatio = 1, maxWidth = 16
   return new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.9));
 }
 
+async function makePreview(file, maxWidth = 720) {
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, maxWidth / bitmap.width);
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+  return canvas.toDataURL("image/jpeg", 0.72);
+}
+
 export default function App() {
   const [dark, setDark] = useState(false);
   const [tab, setTab] = useState("map");
@@ -336,6 +349,7 @@ export default function App() {
   const [manual, setManual] = useState({ name: "", address: "", city: "", note: "", status: "want", category: "other", lat: 0, lng: 0 });
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [processingStage, setProcessingStage] = useState("Распознаю текст");
   const [error, setError] = useState("");
   const [found, setFound] = useState("");
   const [search, setSearch] = useState("");
@@ -459,35 +473,41 @@ export default function App() {
   const handleImage = async (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
-    setProcessing(true); setProgress(0); setError(""); setFound("");
+    setProcessing(true);
+    setProgress(0);
+    setProcessingStage("Подготавливаю изображение");
+    setError("");
+    setFound("");
     try {
-      const preview = await new Promise((resolve, reject) => {
-        const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = reject; reader.readAsDataURL(file);
+      const preview = await makePreview(file);
+      const fullImage = await prepareImage(file, 0, 1, 1200);
+      setProcessingStage("Распознаю текст");
+      const runOcr = async (image, offset = 0, portion = 1) => Tesseract.recognize(image, "eng+pol+rus", {
+        logger: (message) => {
+          if (message.status === "recognizing text") {
+            setProgress(Math.min(99, Math.round((offset + (message.progress || 0) * portion) * 100)));
+          }
+        },
       });
-      const regions = [
-        await prepareImage(file, 0, 1, 1600),
-        await prepareImage(file, 0, 0.42, 1600),
-        await prepareImage(file, 0.35, 0.4, 1600),
-        await prepareImage(file, 0.62, 0.38, 1600),
-      ].filter(Boolean);
-      let combinedText = "";
-      for (let index = 0; index < regions.length; index += 1) {
-        const result = await Tesseract.recognize(regions[index], "eng+pol+rus", {
-          logger: (message) => {
-            if (message.status === "recognizing text") {
-              const regionProgress = (index + (message.progress || 0)) / regions.length;
-              setProgress(Math.round(regionProgress * 100));
-            }
-          },
-        });
-        combinedText += `\n${result.data.text}`;
+
+      let combinedText = (await runOcr(fullImage, 0, 0.75)).data.text;
+      let signals = extractSignals(combinedText);
+
+      if (!signals.names.length || (!signals.addresses.length && !signals.coordinates)) {
+        setProcessingStage("Уточняю данные");
+        const focusedImage = await prepareImage(file, signals.names.length ? 0.5 : 0, 0.5, 1200);
+        combinedText += `\n${(await runOcr(focusedImage, 0.75, 0.25)).data.text}`;
+        signals = extractSignals(combinedText);
       }
 
-      const signals = extractSignals(combinedText);
       if (!signals.names.length && !signals.addresses.length && !signals.coordinates) {
         throw new Error("Не удалось распознать название, адрес или координаты");
       }
+
+      setProgress(100);
+      setProcessingStage("Ищу место на карте");
       const geo = await findPlace(signals);
+      setProcessingStage("Сохраняю место");
       const place = {
         id: Date.now(),
         name: signals.names[0] || geo.displayName || geo.address,
@@ -499,11 +519,15 @@ export default function App() {
       setPlaces((current) => [...current, place]);
       setSelected(place);
       setFound(`${place.name} — ${place.address}`);
-      setTimeout(() => { setAddOpen(false); setTab("map"); setProcessing(false); }, 600);
+      setAddOpen(false);
+      setTab("map");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Не удалось обработать скриншот");
+    } finally {
       setProcessing(false);
-    } finally { event.target.value = ""; }
+      setProcessingStage("Распознаю текст");
+      event.target.value = "";
+    }
   };
 
   const FilterButton = ({ active, onClick, children }) => <button onClick={onClick} className="h-9 whitespace-nowrap rounded-xl px-3 text-sm font-semibold" style={active ? { background: gradient, color: "white" } : { background: palette.soft, color: palette.muted }}>{children}</button>;
@@ -531,14 +555,17 @@ export default function App() {
           </div> : <div className="h-full overflow-y-auto p-4"><div className="mx-auto max-w-4xl"><div className="flex items-center justify-between"><h2 className="text-[22px] font-bold">Мои места</h2><span style={{ color: palette.muted }}>{filteredPlaces.length}</span></div><div className="mt-4 flex items-center gap-2 rounded-xl px-3" style={{ background: palette.panel }}><Search size={18} /><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Поиск" className="h-11 w-full bg-transparent outline-none" /></div><div className="mt-3 flex gap-2 overflow-x-auto"><FilterButton active={statusFilter === "all"} onClick={() => setStatusFilter("all")}>Все</FilterButton><FilterButton active={statusFilter === "want"} onClick={() => setStatusFilter("want")}>Хочу посетить</FilterButton><FilterButton active={statusFilter === "visited"} onClick={() => setStatusFilter("visited")}>Уже была</FilterButton><FilterButton active={categoryFilter === "food"} onClick={() => setCategoryFilter(categoryFilter === "food" ? "all" : "food")}>Еда</FilterButton><FilterButton active={categoryFilter === "other"} onClick={() => setCategoryFilter(categoryFilter === "other" ? "all" : "other")}>Остальное</FilterButton></div><div className="mt-4 grid gap-3 sm:grid-cols-2">{filteredPlaces.map((place) => <div key={place.id} className="flex items-start gap-3 rounded-[18px] p-4" style={{ background: palette.panel }}><button onClick={() => openDetails(place)} className="flex min-w-0 flex-1 items-start gap-3 text-left">{place.screenshot ? <img src={place.screenshot} alt="" className="h-16 w-16 shrink-0 rounded-xl object-cover" /> : <MapPin size={24} style={{ color: place.status === "visited" ? "#16a085" : "#4f7df3" }} />}<div><p className="font-bold">{place.name}</p><p className="text-sm" style={{ color: palette.muted }}>{place.address}</p>{place.note && <p className="mt-2 text-sm">{place.note}</p>}</div></button><button onClick={() => deletePlace(place.id)} className="grid h-10 w-10 place-items-center rounded-xl text-red-500" style={{ background: palette.soft }}><Trash2 size={18} /></button></div>)}</div></div></div>}
         </main>
 
-        <nav className="relative z-[2000] grid grid-cols-2 gap-2 px-3 pb-[max(8px,env(safe-area-inset-bottom))] pt-2" style={{ background: palette.chrome, borderTop: `1px solid ${palette.line}`, pointerEvents: "auto" }}><button onClick={() => setTab("map")} className="flex h-12 items-center justify-center gap-2 rounded-[14px] font-semibold" style={tab === "map" ? { background: gradient, color: "white" } : { color: palette.muted }}><MapIcon size={19} /> Карта</button><button onClick={() => setTab("places")} className="flex h-12 items-center justify-center gap-2 rounded-[14px] font-semibold" style={tab === "places" ? { background: gradient, color: "white" } : { color: palette.muted }}><Bookmark size={19} /> Мои места</button></nav>
+        <nav className="relative z-[4000] grid shrink-0 grid-cols-2 gap-2 px-3 pb-[max(8px,env(safe-area-inset-bottom))] pt-2" style={{ background: palette.chrome, borderTop: `1px solid ${palette.line}`, pointerEvents: "auto", touchAction: "manipulation" }}>
+          <button type="button" onClick={() => setTab("map")} onTouchEnd={(event) => { event.preventDefault(); setTab("map"); }} className="flex h-12 items-center justify-center gap-2 rounded-[14px] font-semibold" style={tab === "map" ? { background: gradient, color: "white" } : { color: palette.muted }}><MapIcon size={19} /> Карта</button>
+          <button type="button" onClick={() => setTab("places")} onTouchEnd={(event) => { event.preventDefault(); setSelected(null); setTab("places"); }} className="flex h-12 items-center justify-center gap-2 rounded-[14px] font-semibold" style={tab === "places" ? { background: gradient, color: "white" } : { color: palette.muted }}><Bookmark size={19} /> Мои места</button>
+        </nav>
       </div>
 
-      {detailsOpen && selected && <div className="fixed inset-0 z-[3000] grid place-items-end bg-black/60 sm:place-items-center sm:p-4" onMouseDown={() => setDetailsOpen(false)}><div className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-t-[26px] p-5 sm:rounded-[26px]" style={{ background: palette.panel }} onMouseDown={(e) => e.stopPropagation()}><div className="flex items-center justify-between"><h3 className="text-lg font-bold">Редактировать место</h3><button onClick={() => setDetailsOpen(false)}><X size={20} /></button></div>{selected.screenshot && <img src={selected.screenshot} alt="Скриншот" className="mt-4 max-h-48 w-full rounded-xl object-contain" />}<label className="mt-4 block text-sm font-semibold">Название</label><input value={edit.name} onChange={(e) => setEdit({ ...edit, name: e.target.value })} className="mt-2 h-11 w-full rounded-xl px-3" style={{ background: palette.soft }} /><label className="mt-3 block text-sm font-semibold">Адрес</label><input value={edit.address} onChange={(e) => setEdit({ ...edit, address: e.target.value })} className="mt-2 h-11 w-full rounded-xl px-3" style={{ background: palette.soft }} /><label className="mt-3 block text-sm font-semibold">Категория</label><div className="mt-2 grid grid-cols-2 gap-2"><FilterButton active={edit.category === "food"} onClick={() => setEdit({ ...edit, category: "food" })}>Еда</FilterButton><FilterButton active={edit.category === "other"} onClick={() => setEdit({ ...edit, category: "other" })}>Остальное</FilterButton></div><label className="mt-3 block text-sm font-semibold">Статус</label><div className="mt-2 grid grid-cols-2 gap-2"><FilterButton active={edit.status === "want"} onClick={() => setEdit({ ...edit, status: "want" })}>Хочу посетить</FilterButton><FilterButton active={edit.status === "visited"} onClick={() => setEdit({ ...edit, status: "visited" })}>Уже была</FilterButton></div><label className="mt-3 block text-sm font-semibold">Заметка</label><textarea value={edit.note} onChange={(e) => setEdit({ ...edit, note: e.target.value })} className="mt-2 min-h-24 w-full rounded-xl p-3" style={{ background: palette.soft }} /><div className="mt-4 grid grid-cols-[1fr_auto] gap-2"><button onClick={saveDetails} className="flex h-12 items-center justify-center gap-2 rounded-xl text-white" style={{ background: gradient }}><Save size={18} /> Сохранить</button><button onClick={() => { deletePlace(selected.id); setDetailsOpen(false); }} className="grid h-12 w-12 place-items-center rounded-xl text-red-500" style={{ background: palette.soft }}><Trash2 size={19} /></button></div></div></div>}
+      {detailsOpen && selected && <div className="fixed inset-0 z-[3000] grid place-items-end bg-black/60 sm:place-items-center sm:p-4" onMouseDown={() => setDetailsOpen(false)}><div className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-t-[26px] p-5 sm:rounded-[26px]" style={{ background: palette.panel }} onMouseDown={(e) => e.stopPropagation()}><div className="flex items-center justify-between"><h3 className="text-lg font-bold">Редактировать место</h3><button onClick={() => setDetailsOpen(false)}><X size={20} /></button></div>{selected.screenshot && <img src={selected.screenshot} alt="Скриншот" className="mt-4 max-h-48 w-full rounded-xl object-contain" />}<label className="mt-4 block text-sm font-semibold">Название</label><input value={edit.name} onChange={(e) => setEdit({ ...edit, name: e.target.value })} className="mt-2 h-11 w-full rounded-xl px-3" style={{ background: palette.soft }} /><label className="mt-3 block text-sm font-semibold">Адрес</label><input value={edit.address} onChange={(e) => setEdit({ ...edit, address: e.target.value })} className="mt-2 h-11 w-full rounded-xl px-3" style={{ background: palette.soft }} /><label className="mt-3 block text-sm font-semibold">Категория</label><div className="mt-2 grid grid-cols-2 gap-2"><FilterButton active={edit.category === "food"} onClick={() => setEdit({ ...edit, category: "food" })}>Еда</FilterButton><FilterButton active={edit.category === "other"} onClick={() => setEdit({ ...edit, category: "other" })}>Остальное</FilterButton></div><label className="mt-3 block text-sm font-semibold">Статус</label><div className="mt-2 grid grid-cols-2 gap-2"><FilterButton active={edit.status === "want"} onClick={() => setEdit({ ...edit, status: "want" })}>Хочу посетить</FilterButton><FilterButton active={edit.status === "visited"} onClick={() => setEdit({ ...edit, status: "visited" })}>Уже была</FilterButton></div><label className="mt-3 block text-sm font-semibold">Заметка</label><textarea value={edit.note} onChange={(e) => setEdit({ ...edit, note: e.target.value })} className="mt-2 min-h-24 w-full rounded-xl p-3" style={{ background: palette.soft }} /><div className="mt-3 flex items-center justify-between rounded-xl p-3" style={{ background: palette.soft }}><div><p className="m-0 text-[11px] font-semibold uppercase tracking-wide" style={{ color: palette.muted }}>Координаты</p><p className="mt-1 text-sm font-medium">{Number(selected.lat).toFixed(6)}, {Number(selected.lng).toFixed(6)}</p></div><button onClick={copyCoordinates} aria-label="Скопировать координаты" className="grid h-10 w-10 place-items-center rounded-xl" style={{ background: palette.panel }}><Copy size={17} /></button></div><div className="mt-4 grid grid-cols-[1fr_auto] gap-2"><button onClick={saveDetails} className="flex h-12 items-center justify-center gap-2 rounded-xl text-white" style={{ background: gradient }}><Save size={18} /> Сохранить</button><button onClick={() => { deletePlace(selected.id); setDetailsOpen(false); }} className="grid h-12 w-12 place-items-center rounded-xl text-red-500" style={{ background: palette.soft }}><Trash2 size={19} /></button></div></div></div>}
 
       {manualOpen && <div className="fixed inset-0 z-[3000] grid place-items-end bg-black/60 sm:place-items-center sm:p-4" onMouseDown={() => setManualOpen(false)}><div className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-t-[26px] p-5 sm:rounded-[26px]" style={{ background: palette.panel }} onMouseDown={(e) => e.stopPropagation()}><div className="flex items-center justify-between"><div><h3 className="text-lg font-bold">Новое место</h3><p className="text-sm" style={{ color: palette.muted }}>{manualLoading ? "Определяю адрес…" : "Координаты и адрес заполнены автоматически"}</p></div><button onClick={() => setManualOpen(false)}><X size={20} /></button></div><label className="mt-4 block text-sm font-semibold">Название</label><input autoFocus value={manual.name} onChange={(e) => setManual({ ...manual, name: e.target.value })} placeholder="Название места" className="mt-2 h-11 w-full rounded-xl px-3" style={{ background: palette.soft }} /><label className="mt-3 block text-sm font-semibold">Адрес</label><input value={manual.address} onChange={(e) => setManual({ ...manual, address: e.target.value })} className="mt-2 h-11 w-full rounded-xl px-3" style={{ background: palette.soft }} /><label className="mt-3 block text-sm font-semibold">Категория</label><div className="mt-2 grid grid-cols-2 gap-2"><FilterButton active={manual.category === "food"} onClick={() => setManual({ ...manual, category: "food" })}>Еда</FilterButton><FilterButton active={manual.category === "other"} onClick={() => setManual({ ...manual, category: "other" })}>Остальное</FilterButton></div><label className="mt-3 block text-sm font-semibold">Заметка</label><textarea value={manual.note} onChange={(e) => setManual({ ...manual, note: e.target.value })} className="mt-2 min-h-20 w-full rounded-xl p-3" style={{ background: palette.soft }} /><button disabled={!manual.name.trim() || manualLoading} onClick={saveManualPlace} className="mt-4 h-12 w-full rounded-xl font-semibold text-white disabled:opacity-50" style={{ background: gradient }}>Сохранить место</button></div></div>}
 
-      {addOpen && <div className="fixed inset-0 z-[3000] grid place-items-end bg-black/60 sm:place-items-center sm:p-4" onMouseDown={() => !processing && setAddOpen(false)}><div className="w-full max-w-lg rounded-t-[26px] p-5 sm:rounded-[26px]" style={{ background: palette.panel }} onMouseDown={(e) => e.stopPropagation()}><div className="flex items-center justify-between"><div><h3 className="text-lg font-bold">Добавить место</h3><p className="text-sm" style={{ color: palette.muted }}>Автоматическое распознавание названия, адреса и координат</p></div><button disabled={processing} onClick={() => setAddOpen(false)}><X size={20} /></button></div><input ref={fileRef} type="file" accept="image/*" onChange={handleImage} className="hidden" /><button disabled={processing} onClick={() => fileRef.current?.click()} className="mt-4 flex h-40 w-full flex-col items-center justify-center gap-3 rounded-[18px]" style={{ background: palette.soft }}>{processing ? <><LoaderCircle className="animate-spin" size={30} /><span>{progress}%</span></> : <><Upload size={28} /><span>Выбрать скриншот</span></>}</button>{error && <p className="mt-3 rounded-xl bg-red-50 p-3 text-sm text-red-600">{error}</p>}</div></div>}
+      {addOpen && <div className="fixed inset-0 z-[3000] grid place-items-end bg-black/60 sm:place-items-center sm:p-4" onMouseDown={() => !processing && setAddOpen(false)}><div className="w-full max-w-lg rounded-t-[26px] p-5 sm:rounded-[26px]" style={{ background: palette.panel }} onMouseDown={(e) => e.stopPropagation()}><div className="flex items-center justify-between"><div><h3 className="text-lg font-bold">Добавить место</h3><p className="text-sm" style={{ color: palette.muted }}>Автоматическое распознавание названия, адреса и координат</p></div><button disabled={processing} onClick={() => setAddOpen(false)}><X size={20} /></button></div><input ref={fileRef} type="file" accept="image/*" onChange={handleImage} className="hidden" /><button disabled={processing} onClick={() => fileRef.current?.click()} className="mt-4 flex h-40 w-full flex-col items-center justify-center gap-3 rounded-[18px]" style={{ background: palette.soft }}>{processing ? <><LoaderCircle className="animate-spin" size={30} /><span className="font-semibold">{processingStage}</span><span className="text-sm">{progress}%</span></> : <><Upload size={28} /><span>Выбрать скриншот</span></>}</button>{error && <p className="mt-3 rounded-xl bg-red-50 p-3 text-sm text-red-600">{error}</p>}</div></div>}
     </div>
   );
 }
