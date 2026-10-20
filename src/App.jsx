@@ -227,11 +227,42 @@ function extractSignals(text) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function nominatimSearch(query) {
+function normalizedWords(value = "") {
+  return value.toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^0-9a-ząćęłńóśźżа-яё ]/gi, " ")
+    .split(/\s+/).filter((word) => word.length > 2);
+}
+
+function isGarbageCandidate(value = "") {
+  const words = normalizedWords(value);
+  if (!words.length) return true;
+  const letters = (value.match(/[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё]/g) || []).length;
+  const upperNoise = (value.match(/\b[A-ZА-ЯЁ]{1,2}\b/g) || []).length;
+  return letters < 4 || upperNoise >= Math.max(2, words.length - 1) || /реклама|рекламодатель|getyourguide|входные билеты|цена|advert/i.test(value);
+}
+
+function officialName(hit) {
+  const address = hit.address || {};
+  return hit.name || address.attraction || address.museum || address.tourism || address.amenity || address.historic || "";
+}
+
+function officialAddress(hit) {
+  const data = hit.address || {};
+  const road = data.road || data.pedestrian || data.footway || data.square || data.neighbourhood || "";
+  const house = data.house_number || "";
+  const postcode = data.postcode || "";
+  const city = data.city || data.town || data.village || data.municipality || "";
+  const compact = [[road, house].filter(Boolean).join(" "), [postcode, city].filter(Boolean).join(" ")].filter(Boolean).join(", ");
+  return compact || hit.display_name || "";
+}
+
+async function nominatimSearch(query, polandOnly = true) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 7000);
   try {
-    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&addressdetails=1&accept-language=pl,en,ru&q=${encodeURIComponent(query)}`;
+    const country = polandOnly ? "&countrycodes=pl" : "";
+    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=8&addressdetails=1&namedetails=1&accept-language=pl,en,ru${country}&q=${encodeURIComponent(query)}`;
     const response = await fetch(url, {
       headers: { "Accept-Language": "pl,en,ru" },
       signal: controller.signal,
@@ -245,15 +276,21 @@ async function nominatimSearch(query) {
 }
 
 function rankResult(hit, names, addresses) {
-  const haystack = `${hit.display_name || ""} ${hit.name || ""}`.toLowerCase();
-  let score = Number(hit.importance || 0);
-  names.forEach((name) => {
-    const words = name.toLowerCase().split(/\s+/).filter((word) => word.length > 2);
-    score += words.filter((word) => haystack.includes(word)).length * 3;
+  const official = officialName(hit);
+  const haystack = `${hit.display_name || ""} ${official}`.toLowerCase();
+  let score = Number(hit.importance || 0) * 5;
+  const countryCode = String(hit.address?.country_code || "").toLowerCase();
+  if (countryCode === "pl") score += 100;
+  if (/polska|poland/i.test(hit.display_name || "")) score += 20;
+  names.forEach((name, index) => {
+    const words = normalizedWords(name);
+    const matches = words.filter((word) => normalizedWords(haystack).includes(word)).length;
+    score += matches * (index === 0 ? 8 : 4);
+    if (words.length && matches / words.length >= 0.6) score += 25;
   });
   addresses.forEach((address) => {
-    const words = address.toLowerCase().split(/\s+/).filter((word) => word.length > 2);
-    score += words.filter((word) => haystack.includes(word)).length * 2;
+    const words = normalizedWords(address);
+    score += words.filter((word) => normalizedWords(haystack).includes(word)).length * 3;
   });
   return score;
 }
@@ -264,32 +301,49 @@ async function findPlace(signals) {
     return { ...signals.coordinates, city: reverse.city, address: reverse.address, displayName: signals.names[0] || reverse.address };
   }
 
-  const mainName = signals.names[0] || "";
-  const mainAddress = signals.addresses[0] || "";
+  const goodNames = signals.names.filter((name) => !isGarbageCandidate(name)).slice(0, 5);
+  const goodAddresses = signals.addresses.filter((address) => !/реклама|рекламодатель|getyourguide|advert/i.test(address)).slice(0, 3);
   const mainCity = signals.cityHints[0] || "Warszawa";
   const queries = unique([
-    mainName && mainAddress ? `${mainName}, ${mainAddress}` : "",
-    mainName ? `${mainName}, ${mainCity}` : "",
-    mainName,
-    mainAddress,
-    signals.names[1] ? `${signals.names[1]}, ${mainCity}` : "",
-  ]).slice(0, 5);
+    ...goodNames.flatMap((name) => [
+      goodAddresses[0] ? `${name}, ${goodAddresses[0]}` : "",
+      `${name}, ${mainCity}, Polska`,
+      `${name}, Polska`,
+    ]),
+    ...goodAddresses.map((address) => `${address}, Polska`),
+  ]).slice(0, 10);
 
-  const hits = [];
+  let hits = [];
   for (let index = 0; index < queries.length; index += 1) {
     if (index) await sleep(250);
-    const results = await nominatimSearch(queries[index]);
-    results.forEach((hit) => hits.push(hit));
+    const results = await nominatimSearch(queries[index], true);
+    hits.push(...results);
     if (results.length && index >= 1) break;
   }
+
+  if (!hits.length) {
+    for (let index = 0; index < Math.min(3, queries.length); index += 1) {
+      const results = await nominatimSearch(queries[index], false);
+      hits.push(...results);
+      if (results.length) break;
+    }
+  }
+
   if (!hits.length) throw new Error("Место не найдено автоматически");
-  const best = hits.sort((a, b) => rankResult(b, signals.names, signals.addresses) - rankResult(a, signals.names, signals.addresses))[0];
+  hits = [...new Map(hits.map((hit) => [`${hit.osm_type}-${hit.osm_id}`, hit])).values()];
+  const best = hits.sort((a, b) => rankResult(b, goodNames, goodAddresses) - rankResult(a, goodNames, goodAddresses))[0];
   const data = best.address || {};
+  const foundName = officialName(best);
+  const recognizedName = goodNames[0] || "";
+  const useOfficialName = foundName && (isGarbageCandidate(recognizedName) || rankResult(best, [recognizedName], []) < 15);
+
   return {
-    lat: Number(best.lat), lng: Number(best.lon),
+    lat: Number(best.lat),
+    lng: Number(best.lon),
     city: data.city || data.town || data.village || data.municipality || inferCityFromAddress(best.display_name || ""),
-    address: mainAddress || best.display_name || "",
-    displayName: mainName || best.name || best.display_name || "Место",
+    address: officialAddress(best),
+    displayName: useOfficialName ? foundName : (recognizedName || foundName || best.display_name || "Место"),
+    countryCode: data.country_code || "",
   };
 }
 
@@ -526,7 +580,7 @@ export default function App() {
 
       const place = {
         id: Date.now(),
-        name: signals.names[0] || geo.displayName || geo.address,
+        name: geo.displayName || signals.names[0] || geo.address,
         address: geo.address || signals.addresses[0] || "",
         note: "",
         status: "want",
