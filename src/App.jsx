@@ -171,55 +171,119 @@ function inferCityFromAddress(address = "") {
   return (parts[parts.length - 1] || "").replace(/^\d{2}-\d{3}\s*/, "").trim();
 }
 
-function extractPlace(text) {
-  const lines = text.split(/\r?\n/).map(cleanLine).filter((line) => line.length > 2);
-  const streetIndex = lines.findIndex((line) =>
-    /\b(ul\.?|aleja|al\.?|plac|pl\.?|street|st\.?|road|rd\.?)\b/i.test(line) ||
-    /[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]+(?:\s+[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż]+)*\s+\d+[A-Za-z]?(?:\/\d+)?/.test(line)
-  );
-  const postalIndex = lines.findIndex((line) => /\b\d{2}-\d{3}\b/.test(line));
-  let address = "";
-  if (streetIndex >= 0 && postalIndex >= 0 && streetIndex !== postalIndex) address = `${lines[streetIndex]}, ${lines[postalIndex]}`;
-  else if (postalIndex >= 0) address = lines[postalIndex];
-  else if (streetIndex >= 0) address = lines[streetIndex];
-  address = normalizeAddress(address);
+function unique(values) {
+  return [...new Set(values.filter(Boolean).map((value) => value.trim()).filter(Boolean))];
+}
 
-  const candidates = lines.slice(0, 18).map((line, index) => {
+function extractCoordinates(text) {
+  const match = text.match(/(-?\d{1,2}[.,]\d{4,})\s*[,; ]\s*(-?\d{1,3}[.,]\d{4,})/);
+  if (!match) return null;
+  const lat = Number(match[1].replace(",", "."));
+  const lng = Number(match[2].replace(",", "."));
+  return Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180 ? { lat, lng } : null;
+}
+
+function extractSignals(text) {
+  const lines = unique(text.split(/\r?\n/).map(cleanLine).filter((line) => line.length > 2));
+  const postalLines = lines.filter((line) => /\b\d{2}-\d{3}\b/.test(line));
+  const streetLines = lines.filter((line) =>
+    /\b(ul\.?|aleja|al\.?|plac|pl\.?|street|st\.?|road|rd\.?|avenue|av\.?)\b/i.test(line) ||
+    /[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё]+(?:\s+[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё]+)*\s+\d+[A-Za-z]?(?:\/\d+)?/.test(line)
+  );
+  const addresses = unique([
+    ...streetLines.flatMap((street) => [street, ...postalLines.map((postal) => `${street}, ${postal}`)]),
+    ...postalLines,
+  ].map(normalizeAddress));
+
+  const nameCandidates = lines.slice(0, 30).map((line, index) => {
     const name = cleanPlaceName(line);
     let score = 0;
     if (name) score += 4;
-    if (index < 8) score += 5;
-    if (streetIndex >= 0 && index < streetIndex) score += 3;
-    if (FOOD_WORDS.test(name)) score += 4;
-    if (GENERIC_NAMES.test(name)) score -= 20;
-    if (/\b\d{2}-\d{3}\b|https?:|www\.|\+?\d{7,}|reviews?|open|closed|menu|route|directions|save|share|website|call|overview/i.test(line)) score -= 15;
+    if (index < 10) score += 7;
+    if (name.length >= 5 && name.length <= 70) score += 3;
+    if (FOOD_WORDS.test(name)) score += 2;
+    if (GENERIC_NAMES.test(name)) score -= 30;
+    if (/исторический памятник|музей|museum|park|парк|barbakan|барбакан|fontann|фонтан/i.test(name)) score += 5;
+    if (/\b\d{2}-\d{3}\b|https?:|www\.|\+?\d{7,}|reviews?|open|closed|menu|route|directions|save|share|website|call|overview|билеты|реклама|advert/i.test(line)) score -= 20;
     return { name, score };
   }).filter((item) => item.name).sort((a, b) => b.score - a.score);
 
-  const name = candidates[0]?.name || "";
-  return { name, address, category: FOOD_WORDS.test(`${name} ${text}`) ? "food" : "other" };
+  const names = unique(nameCandidates.slice(0, 8).map((item) => item.name));
+  const cityHints = unique(lines.flatMap((line) => {
+    const postalCity = line.match(/\b\d{2}-\d{3}\s+([A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё -]{3,})/);
+    const known = line.match(/\b(Warszawa|Warsaw|Варшава|Kraków|Krakow|Gdańsk|Gdansk|Wrocław|Wroclaw|Poznań|Poznan)\b/i);
+    return [postalCity?.[1], known?.[1]];
+  }));
+  if (!cityHints.length) cityHints.push("Warszawa");
+
+  return {
+    names,
+    addresses,
+    cityHints,
+    coordinates: extractCoordinates(text),
+    category: FOOD_WORDS.test(text) ? "food" : "other",
+  };
 }
 
-async function geocodePlace(name, address) {
-  const search = async (query) => {
-    const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&addressdetails=1&q=${encodeURIComponent(query)}`;
-    const response = await fetch(url, { headers: { "Accept-Language": "pl,en" } });
-    return response.ok ? response.json() : [];
-  };
-  let results = await search([name, address].filter(Boolean).join(", "));
-  if (!results.length && address) results = await search(address);
-  if (!results.length) throw new Error("Не удалось найти адрес на карте");
-  const hit = results[0];
-  const data = hit.address || {};
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function nominatimSearch(query) {
+  const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&limit=5&addressdetails=1&accept-language=pl,en,ru&q=${encodeURIComponent(query)}`;
+  const response = await fetch(url, { headers: { "Accept-Language": "pl,en,ru" } });
+  if (!response.ok) return [];
+  return response.json();
+}
+
+function rankResult(hit, names, addresses) {
+  const haystack = `${hit.display_name || ""} ${hit.name || ""}`.toLowerCase();
+  let score = Number(hit.importance || 0);
+  names.forEach((name) => {
+    const words = name.toLowerCase().split(/\s+/).filter((word) => word.length > 2);
+    score += words.filter((word) => haystack.includes(word)).length * 3;
+  });
+  addresses.forEach((address) => {
+    const words = address.toLowerCase().split(/\s+/).filter((word) => word.length > 2);
+    score += words.filter((word) => haystack.includes(word)).length * 2;
+  });
+  return score;
+}
+
+async function findPlace(signals) {
+  if (signals.coordinates) {
+    const reverse = await reverseGeocode(signals.coordinates.lat, signals.coordinates.lng);
+    return { ...signals.coordinates, city: reverse.city, address: reverse.address, displayName: signals.names[0] || reverse.address };
+  }
+
+  const queries = unique([
+    ...signals.names.slice(0, 4).flatMap((name) => [
+      ...signals.addresses.slice(0, 3).map((address) => `${name}, ${address}`),
+      ...signals.cityHints.slice(0, 2).map((city) => `${name}, ${city}`),
+      name,
+    ]),
+    ...signals.addresses.slice(0, 4),
+  ]).slice(0, 12);
+
+  const hits = [];
+  for (let index = 0; index < queries.length; index += 1) {
+    if (index) await sleep(1050);
+    const results = await nominatimSearch(queries[index]);
+    results.forEach((hit) => hits.push(hit));
+    if (hits.length && index >= 2) break;
+  }
+  if (!hits.length) throw new Error("Место не найдено автоматически");
+  const best = hits.sort((a, b) => rankResult(b, signals.names, signals.addresses) - rankResult(a, signals.names, signals.addresses))[0];
+  const data = best.address || {};
   return {
-    lat: Number(hit.lat), lng: Number(hit.lon),
-    city: data.city || data.town || data.village || data.municipality || inferCityFromAddress(hit.display_name || address),
+    lat: Number(best.lat), lng: Number(best.lon),
+    city: data.city || data.town || data.village || data.municipality || inferCityFromAddress(best.display_name || ""),
+    address: signals.addresses[0] || best.display_name || "",
+    displayName: signals.names[0] || best.name || best.display_name || "Место",
   };
 }
 
 async function reverseGeocode(lat, lng) {
-  const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&addressdetails=1&lat=${lat}&lon=${lng}`;
-  const response = await fetch(url, { headers: { "Accept-Language": "pl,en" } });
+  const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&addressdetails=1&accept-language=pl,en,ru&lat=${lat}&lon=${lng}`;
+  const response = await fetch(url, { headers: { "Accept-Language": "pl,en,ru" } });
   if (!response.ok) throw new Error("Не удалось определить адрес");
   const hit = await response.json();
   const data = hit.address || {};
@@ -227,22 +291,24 @@ async function reverseGeocode(lat, lng) {
   const house = data.house_number || "";
   const city = data.city || data.town || data.village || data.municipality || "";
   const postcode = data.postcode || "";
-  const address = [
-    [road, house].filter(Boolean).join(" "),
-    [postcode, city].filter(Boolean).join(" "),
-  ].filter(Boolean).join(", ") || hit.display_name || "";
+  const address = [[road, house].filter(Boolean).join(" "), [postcode, city].filter(Boolean).join(" ")].filter(Boolean).join(", ") || hit.display_name || "";
   return { address, city };
 }
 
-async function cropImage(file, startRatio, heightRatio) {
+async function prepareImage(file, startRatio = 0, heightRatio = 1, maxWidth = 1600) {
   const bitmap = await createImageBitmap(file);
+  const sourceY = Math.round(bitmap.height * startRatio);
+  const sourceHeight = Math.max(1, Math.round(bitmap.height * heightRatio));
+  const scale = Math.min(1, maxWidth / bitmap.width);
   const canvas = document.createElement("canvas");
-  canvas.width = bitmap.width;
-  canvas.height = Math.round(bitmap.height * heightRatio);
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(sourceHeight * scale));
   const context = canvas.getContext("2d");
-  context.drawImage(bitmap, 0, Math.round(bitmap.height * startRatio), bitmap.width, canvas.height, 0, 0, canvas.width, canvas.height);
+  context.fillStyle = "white";
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(bitmap, 0, sourceY, bitmap.width, sourceHeight, 0, 0, canvas.width, canvas.height);
   bitmap.close();
-  return new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+  return new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.9));
 }
 
 export default function App() {
@@ -398,29 +464,53 @@ export default function App() {
       const preview = await new Promise((resolve, reject) => {
         const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = reject; reader.readAsDataURL(file);
       });
-      const runOcr = (image) => Tesseract.recognize(image, "eng+pol", { logger: (message) => { if (message.status === "recognizing text") setProgress(Math.round((message.progress || 0) * 100)); } });
-      const fullResult = await runOcr(file);
-      let combinedText = fullResult.data.text;
-      let extracted = extractPlace(combinedText);
-      if (!extracted.address) {
-        const bottom = await cropImage(file, 0.5, 0.5);
-        if (bottom) combinedText += `\n${(await runOcr(bottom)).data.text}`;
-        extracted = extractPlace(combinedText);
+      const regions = [
+        await prepareImage(file, 0, 1, 1600),
+        await prepareImage(file, 0, 0.42, 1600),
+        await prepareImage(file, 0.35, 0.4, 1600),
+        await prepareImage(file, 0.62, 0.38, 1600),
+      ].filter(Boolean);
+      let combinedText = "";
+      for (let index = 0; index < regions.length; index += 1) {
+        const result = await Tesseract.recognize(regions[index], "eng+pol+rus", {
+          logger: (message) => {
+            if (message.status === "recognizing text") {
+              const regionProgress = (index + (message.progress || 0)) / regions.length;
+              setProgress(Math.round(regionProgress * 100));
+            }
+          },
+        });
+        combinedText += `\n${result.data.text}`;
       }
-      if (!extracted.address) throw new Error("Адрес не распознан. Попробуй более чёткий скриншот.");
-      const geo = await geocodePlace(extracted.name, extracted.address);
-      const place = { id: Date.now(), name: extracted.name || extracted.address.split(",")[0], address: extracted.address, note: "", status: "want", category: extracted.category, city: geo.city || inferCityFromAddress(extracted.address), lat: geo.lat, lng: geo.lng, screenshot: preview };
-      setPlaces((current) => [...current, place]); setSelected(place); setFound(`${place.name} — ${place.address}`);
+
+      const signals = extractSignals(combinedText);
+      if (!signals.names.length && !signals.addresses.length && !signals.coordinates) {
+        throw new Error("Не удалось распознать название, адрес или координаты");
+      }
+      const geo = await findPlace(signals);
+      const place = {
+        id: Date.now(),
+        name: signals.names[0] || geo.displayName || geo.address,
+        address: geo.address || signals.addresses[0] || "",
+        note: "", status: "want", category: signals.category,
+        city: geo.city || inferCityFromAddress(geo.address),
+        lat: geo.lat, lng: geo.lng, screenshot: preview,
+      };
+      setPlaces((current) => [...current, place]);
+      setSelected(place);
+      setFound(`${place.name} — ${place.address}`);
       setTimeout(() => { setAddOpen(false); setTab("map"); setProcessing(false); }, 600);
-    } catch (e) { setError(e instanceof Error ? e.message : "Не удалось обработать скриншот"); setProcessing(false); }
-    finally { event.target.value = ""; }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Не удалось обработать скриншот");
+      setProcessing(false);
+    } finally { event.target.value = ""; }
   };
 
   const FilterButton = ({ active, onClick, children }) => <button onClick={onClick} className="h-9 whitespace-nowrap rounded-xl px-3 text-sm font-semibold" style={active ? { background: gradient, color: "white" } : { background: palette.soft, color: palette.muted }}>{children}</button>;
 
   return (
-    <div className="h-screen w-full overflow-hidden" style={{ background: palette.app, color: palette.text, fontFamily: "Inter,ui-sans-serif,system-ui,sans-serif" }}>
-      <div className="mx-auto grid h-full max-w-6xl grid-rows-[60px_minmax(0,1fr)_64px] overflow-hidden sm:h-[calc(100vh-24px)] sm:translate-y-3 sm:rounded-[28px]" style={{ background: palette.app, border: `1px solid ${palette.line}` }}>
+    <div className="h-[100dvh] w-full overflow-hidden" style={{ background: palette.app, color: palette.text, fontFamily: "Inter,ui-sans-serif,system-ui,sans-serif" }}>
+      <div className="mx-auto grid h-full max-w-6xl grid-rows-[60px_minmax(0,1fr)_64px] overflow-hidden sm:h-[calc(100dvh-24px)] sm:translate-y-3 sm:rounded-[28px]" style={{ background: palette.app, border: `1px solid ${palette.line}` }}>
         <header className="flex items-center justify-between gap-3 px-3 sm:px-5" style={{ background: palette.chrome, borderBottom: `1px solid ${palette.line}` }}>
           <div className="flex items-center gap-2.5"><div className="grid h-9 w-9 place-items-center rounded-xl text-white" style={{ background: gradient }}><MapPin size={18} fill="currentColor" /></div><h1 className="text-lg font-bold">Мои места</h1></div>
           <div className="flex items-center gap-2"><input ref={importRef} type="file" accept="application/json,.json" onChange={importPlaces} className="hidden" /><button onClick={() => importRef.current?.click()} className="grid h-10 w-10 place-items-center rounded-xl" style={{ background: palette.soft }}><FileUp size={18} /></button><button onClick={exportPlaces} className="grid h-10 w-10 place-items-center rounded-xl" style={{ background: palette.soft }}><Download size={18} /></button><button onClick={() => setDark(!dark)} className="grid h-10 w-10 place-items-center rounded-xl" style={{ background: palette.soft }}>{dark ? <Sun size={18} /> : <Moon size={18} />}</button><button onClick={() => { setError(""); setFound(""); setAddOpen(true); }} className="flex h-10 items-center gap-2 rounded-xl px-3 text-white" style={{ background: gradient }}><Plus size={18} /></button></div>
@@ -441,7 +531,7 @@ export default function App() {
           </div> : <div className="h-full overflow-y-auto p-4"><div className="mx-auto max-w-4xl"><div className="flex items-center justify-between"><h2 className="text-[22px] font-bold">Мои места</h2><span style={{ color: palette.muted }}>{filteredPlaces.length}</span></div><div className="mt-4 flex items-center gap-2 rounded-xl px-3" style={{ background: palette.panel }}><Search size={18} /><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Поиск" className="h-11 w-full bg-transparent outline-none" /></div><div className="mt-3 flex gap-2 overflow-x-auto"><FilterButton active={statusFilter === "all"} onClick={() => setStatusFilter("all")}>Все</FilterButton><FilterButton active={statusFilter === "want"} onClick={() => setStatusFilter("want")}>Хочу посетить</FilterButton><FilterButton active={statusFilter === "visited"} onClick={() => setStatusFilter("visited")}>Уже была</FilterButton><FilterButton active={categoryFilter === "food"} onClick={() => setCategoryFilter(categoryFilter === "food" ? "all" : "food")}>Еда</FilterButton><FilterButton active={categoryFilter === "other"} onClick={() => setCategoryFilter(categoryFilter === "other" ? "all" : "other")}>Остальное</FilterButton></div><div className="mt-4 grid gap-3 sm:grid-cols-2">{filteredPlaces.map((place) => <div key={place.id} className="flex items-start gap-3 rounded-[18px] p-4" style={{ background: palette.panel }}><button onClick={() => openDetails(place)} className="flex min-w-0 flex-1 items-start gap-3 text-left">{place.screenshot ? <img src={place.screenshot} alt="" className="h-16 w-16 shrink-0 rounded-xl object-cover" /> : <MapPin size={24} style={{ color: place.status === "visited" ? "#16a085" : "#4f7df3" }} />}<div><p className="font-bold">{place.name}</p><p className="text-sm" style={{ color: palette.muted }}>{place.address}</p>{place.note && <p className="mt-2 text-sm">{place.note}</p>}</div></button><button onClick={() => deletePlace(place.id)} className="grid h-10 w-10 place-items-center rounded-xl text-red-500" style={{ background: palette.soft }}><Trash2 size={18} /></button></div>)}</div></div></div>}
         </main>
 
-        <nav className="relative z-[2000] grid grid-cols-2 gap-2 px-3 py-2" style={{ background: palette.chrome, borderTop: `1px solid ${palette.line}`, pointerEvents: "auto" }}><button onClick={() => setTab("map")} className="flex h-12 items-center justify-center gap-2 rounded-[14px] font-semibold" style={tab === "map" ? { background: gradient, color: "white" } : { color: palette.muted }}><MapIcon size={19} /> Карта</button><button onClick={() => setTab("places")} className="flex h-12 items-center justify-center gap-2 rounded-[14px] font-semibold" style={tab === "places" ? { background: gradient, color: "white" } : { color: palette.muted }}><Bookmark size={19} /> Мои места</button></nav>
+        <nav className="relative z-[2000] grid grid-cols-2 gap-2 px-3 pb-[max(8px,env(safe-area-inset-bottom))] pt-2" style={{ background: palette.chrome, borderTop: `1px solid ${palette.line}`, pointerEvents: "auto" }}><button onClick={() => setTab("map")} className="flex h-12 items-center justify-center gap-2 rounded-[14px] font-semibold" style={tab === "map" ? { background: gradient, color: "white" } : { color: palette.muted }}><MapIcon size={19} /> Карта</button><button onClick={() => setTab("places")} className="flex h-12 items-center justify-center gap-2 rounded-[14px] font-semibold" style={tab === "places" ? { background: gradient, color: "white" } : { color: palette.muted }}><Bookmark size={19} /> Мои места</button></nav>
       </div>
 
       {detailsOpen && selected && <div className="fixed inset-0 z-[3000] grid place-items-end bg-black/60 sm:place-items-center sm:p-4" onMouseDown={() => setDetailsOpen(false)}><div className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-t-[26px] p-5 sm:rounded-[26px]" style={{ background: palette.panel }} onMouseDown={(e) => e.stopPropagation()}><div className="flex items-center justify-between"><h3 className="text-lg font-bold">Редактировать место</h3><button onClick={() => setDetailsOpen(false)}><X size={20} /></button></div>{selected.screenshot && <img src={selected.screenshot} alt="Скриншот" className="mt-4 max-h-48 w-full rounded-xl object-contain" />}<label className="mt-4 block text-sm font-semibold">Название</label><input value={edit.name} onChange={(e) => setEdit({ ...edit, name: e.target.value })} className="mt-2 h-11 w-full rounded-xl px-3" style={{ background: palette.soft }} /><label className="mt-3 block text-sm font-semibold">Адрес</label><input value={edit.address} onChange={(e) => setEdit({ ...edit, address: e.target.value })} className="mt-2 h-11 w-full rounded-xl px-3" style={{ background: palette.soft }} /><label className="mt-3 block text-sm font-semibold">Категория</label><div className="mt-2 grid grid-cols-2 gap-2"><FilterButton active={edit.category === "food"} onClick={() => setEdit({ ...edit, category: "food" })}>Еда</FilterButton><FilterButton active={edit.category === "other"} onClick={() => setEdit({ ...edit, category: "other" })}>Остальное</FilterButton></div><label className="mt-3 block text-sm font-semibold">Статус</label><div className="mt-2 grid grid-cols-2 gap-2"><FilterButton active={edit.status === "want"} onClick={() => setEdit({ ...edit, status: "want" })}>Хочу посетить</FilterButton><FilterButton active={edit.status === "visited"} onClick={() => setEdit({ ...edit, status: "visited" })}>Уже была</FilterButton></div><label className="mt-3 block text-sm font-semibold">Заметка</label><textarea value={edit.note} onChange={(e) => setEdit({ ...edit, note: e.target.value })} className="mt-2 min-h-24 w-full rounded-xl p-3" style={{ background: palette.soft }} /><div className="mt-4 grid grid-cols-[1fr_auto] gap-2"><button onClick={saveDetails} className="flex h-12 items-center justify-center gap-2 rounded-xl text-white" style={{ background: gradient }}><Save size={18} /> Сохранить</button><button onClick={() => { deletePlace(selected.id); setDetailsOpen(false); }} className="grid h-12 w-12 place-items-center rounded-xl text-red-500" style={{ background: palette.soft }}><Trash2 size={19} /></button></div></div></div>}
