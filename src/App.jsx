@@ -67,7 +67,7 @@ function signals(text){
     return{name:line,rank};
   }).filter(x=>x.rank>0).sort((a,b)=>b.rank-a.rank).slice(0,10).map(x=>x.name);
   const city=uniq(lines.flatMap(x=>[(x.match(/\b\d{2}-\d{3}\s+([A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźżА-Яа-яЁё -]{3,})/)||[])[1],(x.match(/\b(Warszawa|Warsaw|Варшава|Konstancin-Jeziorna|Kraków|Gdańsk|Wrocław|Poznań)\b/i)||[])[1]]));
-  if(!city.length)city.push("Warszawa");
+  
   const c=text.match(/(-?\d{1,2}[.,]\d{4,})\s*[,; ]\s*(-?\d{1,3}[.,]\d{4,})/);
   const coords=c?{lat:Number(c[1].replace(",",".")),lng:Number(c[2].replace(",","."))}:null;
   return{names:uniq(names),addresses,city,coords,isFood:FOOD.test(text)};
@@ -102,8 +102,9 @@ function expandedNames(names){
 function photonName(feature){const p=feature.properties||{};return p.name||p.street||p.city||""}
 function photonAddress(feature){const p=feature.properties||{};const first=[p.street,p.housenumber].filter(Boolean).join(" ");const second=[p.postcode,p.city||p.town||p.village||p.county].filter(Boolean).join(" ");return[first,second].filter(Boolean).join(", ")||[p.name,p.city,p.country].filter(Boolean).join(", ")}
 function photonCountry(feature){const p=feature.properties||{};return String(p.countrycode||p.country||"").toLowerCase()}
-async function photonSearch(query){
-  const params=new URLSearchParams({q:query,lang:"pl",limit:"10",lat:"52.2297",lon:"21.0122"});
+async function photonSearch(query,polandOnly=true){
+  const params=new URLSearchParams({q:query,lang:"pl",limit:"10"});
+  if(polandOnly)params.set("bbox","14.12,49.00,24.15,54.84");
   const data=await fetchJson(`https://photon.komoot.io/api/?${params}`);
   return data?.features||[];
 }
@@ -125,42 +126,77 @@ async function reverse(lat,lng){
 }
 async function findCandidates(s){
   if(s.coords){const r=await reverse(s.coords.lat,s.coords.lng);return[{...s.coords,name:s.names[0]||r.address,address:r.address,city:r.city,score:999,country:"pl"}]}
-  const rawNames=uniq(s.names).slice(0,8),names=expandedNames(rawNames).slice(0,10),addresses=uniq(s.addresses.filter(value=>!NOISE.test(value))).slice(0,3),city=s.city[0]||"Warszawa";
-  const titleQueries=uniq(names.slice(0,6).flatMap(name=>[`${name}, ${city}`,name])).slice(0,8);
-  const [photonGroups,wikiPlGroups,wikiRuGroups]=await Promise.all([
-    Promise.all(titleQueries.map(photonSearch)),
-    Promise.all(names.slice(0,4).map(name=>wikiSearch(name,"pl"))),
-    Promise.all(names.slice(0,4).map(name=>wikiSearch(name,"ru"))),
-  ]);
-  let candidates=[];
-  photonGroups.flat().forEach(feature=>{
-    const p=feature.properties||{},coords=feature.geometry?.coordinates||[];
-    const name=photonName(feature)||names[0]||"Место",address=photonAddress(feature),country=photonCountry(feature);
-    const bestNameMatch=Math.max(0,...names.map(source=>titleSimilarity(source,`${name} ${address}`)));
-    let score=bestNameMatch*240;
-    if(country==="pl"||country==="poland"||country==="polska")score+=100;
-    if(String(p.city||p.town||p.village||"").toLowerCase().includes(city.toLowerCase()))score+=40;
-    addresses.forEach(source=>score+=titleSimilarity(source,address)*150);
-    if(Number.isFinite(Number(coords[1]))&&Number.isFinite(Number(coords[0])))candidates.push({name,address,city:p.city||p.town||p.village||p.county||"",lat:Number(coords[1]),lng:Number(coords[0]),score,country:country==="pl"?"pl":country,source:"Photon"});
-  });
-  [...wikiPlGroups.flat(),...wikiRuGroups.flat()].forEach(page=>{
-    const match=Math.max(0,...names.map(source=>titleSimilarity(source,`${page.title} ${page.description}`)));
-    if(match>=.45)candidates.push({name:page.title,address:page.description||"Warszawa, Polska",city:"Warszawa",lat:Number(page.lat),lng:Number(page.lng),score:match*230+90,country:"pl",source:"Wikipedia"});
-  });
-  const bestScore=candidates.length?Math.max(...candidates.map(item=>item.score)):0;
-  if(bestScore<150){
-    const query=names[0]?`${names[0]}, ${city}, Polska`:(addresses[0]||"");
-    if(query){
-      const hits=await nominatimSearch(query);
-      hits.forEach(hit=>{const a=hit.address||{},name=officialName(hit)||names[0]||hit.display_name,address=officialAddress(hit),match=Math.max(0,...names.map(source=>titleSimilarity(source,`${name} ${address}`)));candidates.push({name,address,city:a.city||a.town||a.village||a.municipality||"",lat:Number(hit.lat),lng:Number(hit.lon),score:match*230+80,country:a.country_code||"pl",source:"Nominatim"})});
-    }
+
+  const rawNames=uniq(s.names).slice(0,8);
+  const names=expandedNames(rawNames).slice(0,10);
+  const addresses=uniq(s.addresses.filter(value=>!NOISE.test(value))).slice(0,3);
+  const city=s.city[0]||"";
+  const titleQueries=uniq(names.slice(0,5).flatMap(name=>city?[`${name}, ${city}`,name]:[name])).slice(0,6);
+  const attractionPattern=/muzeum|museum|музей|barbakan|барбакан|park|парк|fontann|фонтан|zamek|castle|замок|pałac|palace|дворец|pomnik|monument|памятник/i;
+  const useWikipedia=names.some(name=>attractionPattern.test(name));
+
+  const polandPhoton=(await Promise.all(titleQueries.map(query=>photonSearch(query,true)))).flat();
+  let candidates=polandPhoton.map(feature=>mapPhotonCandidate(feature,names,addresses,city,true));
+
+  if(useWikipedia){
+    const [plPages,ruPages]=await Promise.all([
+      Promise.all(names.slice(0,3).map(name=>wikiSearch(name,"pl"))),
+      Promise.all(names.slice(0,3).map(name=>wikiSearch(name,"ru"))),
+    ]);
+    [...plPages.flat(),...ruPages.flat()].forEach(page=>{
+      const match=Math.max(0,...names.map(source=>titleSimilarity(source,`${page.title} ${page.description}`)));
+      if(match>=.45)candidates.push({name:page.title,address:page.description||"Polska",city:city||"",lat:Number(page.lat),lng:Number(page.lng),score:match*240+85,country:"pl",source:"Wikipedia"});
+    });
   }
-  if(!candidates.length&&addresses[0]){
+
+  let bestPoland=candidates.length?Math.max(...candidates.map(item=>item.score)):0;
+  if(bestPoland<150){
+    const globalPhoton=(await Promise.all(titleQueries.slice(0,4).map(query=>photonSearch(query,false)))).flat();
+    candidates.push(...globalPhoton.map(feature=>mapPhotonCandidate(feature,names,addresses,city,false)));
+  }
+
+  let bestOverall=candidates.length?Math.max(...candidates.map(item=>item.score)):0;
+  if(bestOverall<150&&names[0]){
+    const query=[names[0],city,"Polska"].filter(Boolean).join(", ");
+    const hits=await nominatimSearch(query);
+    hits.forEach(hit=>candidates.push(mapNominatimCandidate(hit,names,addresses,city)));
+  }
+
+  if((!candidates.length||bestOverall<120)&&addresses[0]){
     const hits=await nominatimSearch(addresses[0]);
-    hits.forEach(hit=>{const a=hit.address||{};candidates.push({name:names[0]||officialName(hit)||"Место",address:officialAddress(hit),city:a.city||a.town||a.village||a.municipality||"",lat:Number(hit.lat),lng:Number(hit.lon),score:140,country:a.country_code||"pl",source:"Address"})});
+    hits.forEach(hit=>{
+      const candidate=mapNominatimCandidate(hit,names,addresses,city);
+      candidate.name=names[0]||candidate.name;
+      candidate.score=Math.max(candidate.score,145);
+      candidate.source="Address";
+      candidates.push(candidate);
+    });
   }
+
   const deduped=[...new Map(candidates.filter(item=>Number.isFinite(item.lat)&&Number.isFinite(item.lng)).map(item=>[`${item.lat.toFixed(5)}|${item.lng.toFixed(5)}`,item])).values()];
   return deduped.sort((a,b)=>b.score-a.score).slice(0,6);
+}
+function mapPhotonCandidate(feature,names,addresses,city,polandPass){
+  const p=feature.properties||{},coords=feature.geometry?.coordinates||[];
+  const name=photonName(feature)||names[0]||"Место",address=photonAddress(feature),country=photonCountry(feature);
+  const bestNameMatch=Math.max(0,...names.map(source=>titleSimilarity(source,`${name} ${address}`)));
+  let score=bestNameMatch*245;
+  if(country==="pl"||country==="poland"||country==="polska")score+=75;
+  if(polandPass)score+=10;
+  const foundCity=String(p.city||p.town||p.village||"");
+  if(city&&foundCity.toLowerCase().includes(city.toLowerCase()))score+=55;
+  addresses.forEach(source=>score+=titleSimilarity(source,address)*165);
+  return{name,address,city:p.city||p.town||p.village||p.county||"",lat:Number(coords[1]),lng:Number(coords[0]),score,country:country==="pl"?"pl":country,source:"Photon"};
+}
+function mapNominatimCandidate(hit,names,addresses,city){
+  const a=hit.address||{},name=officialName(hit)||names[0]||hit.display_name,address=officialAddress(hit);
+  const match=Math.max(0,...names.map(source=>titleSimilarity(source,`${name} ${address}`)));
+  let score=match*235+60;
+  if(a.country_code==="pl")score+=75;
+  const foundCity=a.city||a.town||a.village||a.municipality||"";
+  if(city&&foundCity.toLowerCase().includes(city.toLowerCase()))score+=55;
+  addresses.forEach(source=>score+=titleSimilarity(source,address)*165);
+  return{name,address,city:foundCity,lat:Number(hit.lat),lng:Number(hit.lon),score,country:a.country_code||"",source:"Nominatim"};
 }
 async function imageBlob(file,start=0,height=1,max=1300){
   const b=await createImageBitmap(file),y=Math.round(b.height*start),sh=Math.max(1,Math.round(b.height*height)),scale=Math.min(1,max/b.width),c=document.createElement("canvas");
@@ -183,7 +219,7 @@ export default function App(){
   const del=id=>{setPlaces(a=>a.filter(p=>p.id!==id));if(selected?.id===id)setSelected(null)};
   const route=()=>selected&&window.open(`https://www.google.com/maps/dir/?api=1&destination=${selected.lat},${selected.lng}`,"_blank");
   const useCandidate=c=>{const p={id:Date.now(),name:c.name,address:c.address,city:c.city,note:"",status:pending.status||"want",isFood:pending.isFood,lat:c.lat,lng:c.lng,screenshot:pending.screenshot};setPlaces(a=>[...a,p]);setSelected(p);setCandidateOpen(false);setPending(null);setTab("map")};
-  const processImage=async e=>{const file=e.target.files?.[0];if(!file)return;setProcessing(true);setError("");setProgress(0);try{setStage("Считываю скриншот");const pv=await preview(file),img=await imageBlob(file,0,1,1300);const result=await Tesseract.recognize(img,"eng+pol+rus",{logger:m=>m.status==="recognizing text"&&setProgress(Math.round((m.progress||0)*100))});const sig=signals(result.data.text);if(!sig.names.length&&!sig.addresses.length&&!sig.coords)throw Error("Не удалось распознать название, адрес или координаты");setStage("Ищу место по названию в Польше");const list=await findCandidates(sig);if(!list.length)throw Error("По распознанному названию и адресу место не найдено");setPending({screenshot:pv,isFood:sig.isFood,status:"want",recognizedName:sig.names[0]||"",recognizedAddress:sig.addresses[0]||""});setCandidates(list);setCandidateOpen(true);setAddOpen(false)}catch(x){setError(x.message||"Ошибка распознавания")}finally{setProcessing(false);e.target.value=""}};
+  const processImage=async e=>{const file=e.target.files?.[0];if(!file)return;setProcessing(true);setError("");setProgress(0);try{setStage("Считываю скриншот");const pv=await preview(file),img=await imageBlob(file,0,1,1300);const result=await Tesseract.recognize(img,"eng+pol+rus",{logger:m=>m.status==="recognizing text"&&setProgress(Math.round((m.progress||0)*100))});const sig=signals(result.data.text);if(!sig.names.length&&!sig.addresses.length&&!sig.coords)throw Error("Не удалось распознать название, адрес или координаты");setStage("Ищу место: сначала в Польше");const list=await findCandidates(sig);if(!list.length)throw Error("По распознанному названию и адресу место не найдено");setPending({screenshot:pv,isFood:sig.isFood,status:"want",recognizedName:sig.names[0]||"",recognizedAddress:sig.addresses[0]||""});setCandidates(list);setCandidateOpen(true);setAddOpen(false)}catch(x){setError(x.message||"Ошибка распознавания")}finally{setProcessing(false);e.target.value=""}};
   const longPress=async ll=>{setManual({name:"",address:"",note:"",status:"want",isFood:false,lat:ll.lat,lng:ll.lng});setManualOpen(true);try{const r=await reverse(ll.lat,ll.lng);setManual(m=>({...m,address:r.address,city:r.city}))}catch{}};
   const saveManual=()=>{if(!manual.name.trim())return;const p={...manual,id:Date.now()};setPlaces(a=>[...a,p]);setSelected(p);setManualOpen(false)};
   const locate=()=>navigator.geolocation?.getCurrentPosition(({coords})=>{setSelected(null);mapRef.current?.flyTo([coords.latitude,coords.longitude],16)});
