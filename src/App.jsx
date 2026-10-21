@@ -72,50 +72,94 @@ function signals(text){
   const coords=c?{lat:Number(c[1].replace(",",".")),lng:Number(c[2].replace(",","."))}:null;
   return{names:uniq(names),addresses,city,coords,isFood:FOOD.test(text)};
 }
-async function fetchJson(url, timeoutMs=7000){
+async function fetchJson(url, timeoutMs=6500){
   const controller=new AbortController();
   const timer=setTimeout(()=>controller.abort(),timeoutMs);
-  try{const response=await fetch(url,{signal:controller.signal,headers:{"Accept-Language":"pl,en,ru"}});return response.ok?await response.json():null}catch{return null}finally{clearTimeout(timer)}
+  try{
+    const response=await fetch(url,{signal:controller.signal,headers:{"Accept-Language":"pl,en,ru"}});
+    if(!response.ok)return null;
+    return await response.json();
+  }catch{return null}finally{clearTimeout(timer)}
+}
+function titleSimilarity(source,result){
+  const a=words(source),b=words(result);
+  if(!a.length||!b.length)return 0;
+  const matches=a.filter(word=>b.some(candidate=>candidate===word||candidate.startsWith(word)||word.startsWith(candidate))).length;
+  return matches/a.length;
+}
+function expandedNames(names){
+  const aliases=[];
+  names.forEach(name=>{
+    aliases.push(name);
+    const n=name.toLowerCase();
+    if(/варшавск.*барбакан|барбакан.*варшав/i.test(n))aliases.push("Barbakan Warszawski");
+    if(/музей.*варшавск.*восстан|варшавск.*восстан/i.test(n))aliases.push("Muzeum Powstania Warszawskiego");
+    if(/музей.*польск.*евре|polin/i.test(n))aliases.push("Muzeum Historii Żydów Polskich POLIN");
+    if(/парк.*фонтан|фонтан.*варшав/i.test(n))aliases.push("Multimedialny Park Fontann");
+  });
+  return uniq(aliases);
 }
 function photonName(feature){const p=feature.properties||{};return p.name||p.street||p.city||""}
-function photonAddress(feature){const p=feature.properties||{};const first=[p.street,p.housenumber].filter(Boolean).join(" ");const second=[p.postcode,p.city||p.town||p.village||p.county].filter(Boolean).join(" ");return [first,second].filter(Boolean).join(", ")||[p.name,p.city,p.country].filter(Boolean).join(", ")}
+function photonAddress(feature){const p=feature.properties||{};const first=[p.street,p.housenumber].filter(Boolean).join(" ");const second=[p.postcode,p.city||p.town||p.village||p.county].filter(Boolean).join(" ");return[first,second].filter(Boolean).join(", ")||[p.name,p.city,p.country].filter(Boolean).join(", ")}
 function photonCountry(feature){const p=feature.properties||{};return String(p.countrycode||p.country||"").toLowerCase()}
-function titleSimilarity(source,result){const a=words(source),b=words(result);if(!a.length||!b.length)return 0;return a.filter(word=>b.some(candidate=>candidate===word||candidate.startsWith(word)||word.startsWith(candidate))).length/a.length}
-async function photonSearch(query,city="Warszawa"){
-  const params=new URLSearchParams({q:query,lang:"pl",limit:"12",lat:"52.2297",lon:"21.0122"});
-  const data=await fetchJson(`https://photon.komoot.io/api/?${params.toString()}`);
+async function photonSearch(query){
+  const params=new URLSearchParams({q:query,lang:"pl",limit:"10",lat:"52.2297",lon:"21.0122"});
+  const data=await fetchJson(`https://photon.komoot.io/api/?${params}`);
   return data?.features||[];
 }
-async function nominatimAddressSearch(query){
-  const params=new URLSearchParams({format:"jsonv2",limit:"5",addressdetails:"1",countrycodes:"pl",q:query});
-  return await fetchJson(`https://nominatim.openstreetmap.org/search?${params.toString()}`)||[];
+async function wikiSearch(query,language){
+  const params=new URLSearchParams({action:"query",generator:"search",gsrsearch:query,gsrlimit:"5",prop:"coordinates|description",format:"json",origin:"*"});
+  const data=await fetchJson(`https://${language}.wikipedia.org/w/api.php?${params}`);
+  return Object.values(data?.query?.pages||{}).filter(page=>page.coordinates?.[0]).map(page=>({title:page.title,description:page.description||"",lat:page.coordinates[0].lat,lng:page.coordinates[0].lon}));
+}
+async function nominatimSearch(query){
+  const params=new URLSearchParams({format:"jsonv2",limit:"6",addressdetails:"1",namedetails:"1",countrycodes:"pl",q:query});
+  return await fetchJson(`https://nominatim.openstreetmap.org/search?${params}`)||[];
 }
 function officialName(hit){const a=hit.address||{};return hit.name||hit.namedetails?.name||a.attraction||a.museum||a.amenity||a.historic||""}
 function officialAddress(hit){const a=hit.address||{};const line=[[a.road||a.pedestrian||a.square||a.neighbourhood,a.house_number].filter(Boolean).join(" "),[a.postcode,a.city||a.town||a.village||a.municipality].filter(Boolean).join(" ")].filter(Boolean).join(", ");return line||hit.display_name||""}
-async function reverse(lat,lng){const data=await fetchJson(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&addressdetails=1&accept-language=pl,en,ru&lat=${lat}&lon=${lng}`);if(!data)throw Error("Не удалось определить адрес");const a=data.address||{};return{address:officialAddress(data),city:a.city||a.town||a.village||a.municipality||""}}
+async function reverse(lat,lng){
+  const data=await fetchJson(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&addressdetails=1&accept-language=pl,en,ru&lat=${lat}&lon=${lng}`);
+  if(!data)throw Error("Не удалось определить адрес");
+  const a=data.address||{};return{address:officialAddress(data),city:a.city||a.town||a.village||a.municipality||""};
+}
 async function findCandidates(s){
-  if(s.coords){const result=await reverse(s.coords.lat,s.coords.lng);return[{...s.coords,name:s.names[0]||result.address,address:result.address,city:result.city,score:999,country:"pl"}]}
-  const names=uniq(s.names).slice(0,6),addresses=uniq(s.addresses.filter(value=>!NOISE.test(value))).slice(0,3),city=s.city[0]||"Warszawa";
-  const titleQueries=uniq(names.flatMap(name=>[`${name}, ${city}`,name])).slice(0,6);
-  const photonGroups=await Promise.all(titleQueries.map(query=>photonSearch(query,city)));
-  let candidates=photonGroups.flat().map(feature=>{
+  if(s.coords){const r=await reverse(s.coords.lat,s.coords.lng);return[{...s.coords,name:s.names[0]||r.address,address:r.address,city:r.city,score:999,country:"pl"}]}
+  const rawNames=uniq(s.names).slice(0,8),names=expandedNames(rawNames).slice(0,10),addresses=uniq(s.addresses.filter(value=>!NOISE.test(value))).slice(0,3),city=s.city[0]||"Warszawa";
+  const titleQueries=uniq(names.slice(0,6).flatMap(name=>[`${name}, ${city}`,name])).slice(0,8);
+  const [photonGroups,wikiPlGroups,wikiRuGroups]=await Promise.all([
+    Promise.all(titleQueries.map(photonSearch)),
+    Promise.all(names.slice(0,4).map(name=>wikiSearch(name,"pl"))),
+    Promise.all(names.slice(0,4).map(name=>wikiSearch(name,"ru"))),
+  ]);
+  let candidates=[];
+  photonGroups.flat().forEach(feature=>{
     const p=feature.properties||{},coords=feature.geometry?.coordinates||[];
     const name=photonName(feature)||names[0]||"Место",address=photonAddress(feature),country=photonCountry(feature);
-    let rank=titleSimilarity(names[0]||"",`${name} ${address}`)*220;
-    if(country==="pl"||country==="poland"||country==="polska")rank+=100;
-    if(String(p.city||p.town||p.village||"").toLowerCase().includes(city.toLowerCase()))rank+=45;
-    addresses.forEach(source=>{const similarity=titleSimilarity(source,address);rank+=similarity*140});
-    rank+=Number(p.importance||0)*10;
-    return{name,address,city:p.city||p.town||p.village||p.county||"",lat:Number(coords[1]),lng:Number(coords[0]),score:rank,country:country==="pl"?"pl":country};
-  }).filter(item=>Number.isFinite(item.lat)&&Number.isFinite(item.lng));
-
-  const bestTitleScore=candidates.length?Math.max(...candidates.map(item=>item.score)):0;
-  if(addresses[0]&&bestTitleScore<150){
-    const addressHits=await nominatimAddressSearch(addresses[0]);
-    candidates.push(...addressHits.map(hit=>{const a=hit.address||{};return{name:names[0]||officialName(hit)||hit.display_name,address:officialAddress(hit),city:a.city||a.town||a.village||a.municipality||"",lat:Number(hit.lat),lng:Number(hit.lon),score:170,country:a.country_code||"pl"}}));
+    const bestNameMatch=Math.max(0,...names.map(source=>titleSimilarity(source,`${name} ${address}`)));
+    let score=bestNameMatch*240;
+    if(country==="pl"||country==="poland"||country==="polska")score+=100;
+    if(String(p.city||p.town||p.village||"").toLowerCase().includes(city.toLowerCase()))score+=40;
+    addresses.forEach(source=>score+=titleSimilarity(source,address)*150);
+    if(Number.isFinite(Number(coords[1]))&&Number.isFinite(Number(coords[0])))candidates.push({name,address,city:p.city||p.town||p.village||p.county||"",lat:Number(coords[1]),lng:Number(coords[0]),score,country:country==="pl"?"pl":country,source:"Photon"});
+  });
+  [...wikiPlGroups.flat(),...wikiRuGroups.flat()].forEach(page=>{
+    const match=Math.max(0,...names.map(source=>titleSimilarity(source,`${page.title} ${page.description}`)));
+    if(match>=.45)candidates.push({name:page.title,address:page.description||"Warszawa, Polska",city:"Warszawa",lat:Number(page.lat),lng:Number(page.lng),score:match*230+90,country:"pl",source:"Wikipedia"});
+  });
+  const bestScore=candidates.length?Math.max(...candidates.map(item=>item.score)):0;
+  if(bestScore<150){
+    const query=names[0]?`${names[0]}, ${city}, Polska`:(addresses[0]||"");
+    if(query){
+      const hits=await nominatimSearch(query);
+      hits.forEach(hit=>{const a=hit.address||{},name=officialName(hit)||names[0]||hit.display_name,address=officialAddress(hit),match=Math.max(0,...names.map(source=>titleSimilarity(source,`${name} ${address}`)));candidates.push({name,address,city:a.city||a.town||a.village||a.municipality||"",lat:Number(hit.lat),lng:Number(hit.lon),score:match*230+80,country:a.country_code||"pl",source:"Nominatim"})});
+    }
   }
-
-  const deduped=[...new Map(candidates.map(item=>[`${item.name.toLowerCase()}|${item.lat.toFixed(5)}|${item.lng.toFixed(5)}`,item])).values()];
+  if(!candidates.length&&addresses[0]){
+    const hits=await nominatimSearch(addresses[0]);
+    hits.forEach(hit=>{const a=hit.address||{};candidates.push({name:names[0]||officialName(hit)||"Место",address:officialAddress(hit),city:a.city||a.town||a.village||a.municipality||"",lat:Number(hit.lat),lng:Number(hit.lon),score:140,country:a.country_code||"pl",source:"Address"})});
+  }
+  const deduped=[...new Map(candidates.filter(item=>Number.isFinite(item.lat)&&Number.isFinite(item.lng)).map(item=>[`${item.lat.toFixed(5)}|${item.lng.toFixed(5)}`,item])).values()];
   return deduped.sort((a,b)=>b.score-a.score).slice(0,6);
 }
 async function imageBlob(file,start=0,height=1,max=1300){
@@ -139,7 +183,7 @@ export default function App(){
   const del=id=>{setPlaces(a=>a.filter(p=>p.id!==id));if(selected?.id===id)setSelected(null)};
   const route=()=>selected&&window.open(`https://www.google.com/maps/dir/?api=1&destination=${selected.lat},${selected.lng}`,"_blank");
   const useCandidate=c=>{const p={id:Date.now(),name:c.name,address:c.address,city:c.city,note:"",status:pending.status||"want",isFood:pending.isFood,lat:c.lat,lng:c.lng,screenshot:pending.screenshot};setPlaces(a=>[...a,p]);setSelected(p);setCandidateOpen(false);setPending(null);setTab("map")};
-  const processImage=async e=>{const file=e.target.files?.[0];if(!file)return;setProcessing(true);setError("");setProgress(0);try{setStage("Считываю скриншот");const pv=await preview(file),img=await imageBlob(file,0,1,1300);const result=await Tesseract.recognize(img,"eng+pol+rus",{logger:m=>m.status==="recognizing text"&&setProgress(Math.round((m.progress||0)*100))});const sig=signals(result.data.text);if(!sig.names.length&&!sig.addresses.length&&!sig.coords)throw Error("Не удалось распознать название, адрес или координаты");setStage("Ищу место по названию в Польше");const list=await findCandidates(sig);if(!list.length)throw Error("Не удалось автоматически найти подходящее место");setPending({screenshot:pv,isFood:sig.isFood,status:"want",recognizedName:sig.names[0]||"",recognizedAddress:sig.addresses[0]||""});setCandidates(list);setCandidateOpen(true);setAddOpen(false)}catch(x){setError(x.message||"Ошибка распознавания")}finally{setProcessing(false);e.target.value=""}};
+  const processImage=async e=>{const file=e.target.files?.[0];if(!file)return;setProcessing(true);setError("");setProgress(0);try{setStage("Считываю скриншот");const pv=await preview(file),img=await imageBlob(file,0,1,1300);const result=await Tesseract.recognize(img,"eng+pol+rus",{logger:m=>m.status==="recognizing text"&&setProgress(Math.round((m.progress||0)*100))});const sig=signals(result.data.text);if(!sig.names.length&&!sig.addresses.length&&!sig.coords)throw Error("Не удалось распознать название, адрес или координаты");setStage("Ищу место по названию в Польше");const list=await findCandidates(sig);if(!list.length)throw Error("По распознанному названию и адресу место не найдено");setPending({screenshot:pv,isFood:sig.isFood,status:"want",recognizedName:sig.names[0]||"",recognizedAddress:sig.addresses[0]||""});setCandidates(list);setCandidateOpen(true);setAddOpen(false)}catch(x){setError(x.message||"Ошибка распознавания")}finally{setProcessing(false);e.target.value=""}};
   const longPress=async ll=>{setManual({name:"",address:"",note:"",status:"want",isFood:false,lat:ll.lat,lng:ll.lng});setManualOpen(true);try{const r=await reverse(ll.lat,ll.lng);setManual(m=>({...m,address:r.address,city:r.city}))}catch{}};
   const saveManual=()=>{if(!manual.name.trim())return;const p={...manual,id:Date.now()};setPlaces(a=>[...a,p]);setSelected(p);setManualOpen(false)};
   const locate=()=>navigator.geolocation?.getCurrentPosition(({coords})=>{setSelected(null);mapRef.current?.flyTo([coords.latitude,coords.longitude],16)});
