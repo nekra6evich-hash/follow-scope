@@ -184,6 +184,18 @@ function candidateAllowed(item,signals,target){
   }
   return nm>=.58;
 }
+async function addressFallback(signals,score=245){
+  for(const raw of signals.addresses.slice(0,4)){
+    for(const query of uniq([raw,raw.replace(/\/\w+/g,""),[raw,signals.city].filter(Boolean).join(", ")])){
+      for(const poland of[true,false]){
+        const hits=await nominatim(query,poland);
+        if(hits.length){const h=hits[0],a=h.address||{};return{name:signals.names[0]||officialName(h)||"Место",address:officialAddress(h),city:a.city||a.town||a.village||a.municipality||signals.city||"",lat:Number(h.lat),lng:Number(h.lon),score,country:a.country_code||"",type:"address",nameMatch:1,addressMatch:1}}
+      }
+    }
+  }
+  return null;
+}
+
 async function validatedAddressFallback(signals,target){
   const b=signals.business||{},expected={street:b.street||"",house:b.house||"",postcode:b.postcode||"",city:b.city||signals.city||""};
   if(!expected.street&&!expected.postcode)return null;
