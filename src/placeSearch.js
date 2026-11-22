@@ -47,21 +47,87 @@ export function extractSignals(text){
   const raw=String(text||""),lines=uniq(raw.split(/\r?\n/).map(clean).filter(line=>line.length>1)),rule=matchedRule(raw),postal=lines.filter(line=>/\b\d{2}-\d{3}\b/.test(line)),streetLines=lines.filter(line=>!NOISE.test(line)&&looksLikeAddress(line));
   const addresses=uniq([...(rule?.address?[rule.address]:[]),...streetLines,...streetLines.flatMap(street=>postal.filter(post=>post!==street).map(post=>`${street}, ${post}`)),...postal]);
   const scored=lines.map((line,index)=>({line:normalizeName(line),score:lineScore(line,index,rule)})).filter(x=>x.score>4).sort((a,b)=>b.score-a.score);
-  const business=extractBusinessStructure(raw,lines,rule),isBusiness=business.type==="brand"||business.type==="food";
+  const business=extractBusinessStructure(raw,lines,rule),isBusiness=!['landmark','group'].includes(rule?.kind)&&["brand","food","lodging","airport","service"].includes(business.type);
   const names=uniq([...(rule?.names||[]),...(isBusiness?[business.name]:[]),...scored.slice(0,8).map(x=>x.line)]),cities=uniq([...(isBusiness?[business.city]:[]),rule?.city,...lines.map(normalizeCity)]).filter(Boolean),coord=raw.match(/(-?\d{1,2}[.,]\d{4,})\s*[,; ]\s*(-?\d{1,3}[.,]\d{4,})/);
   return{names,addresses:uniq([...(isBusiness?[business.fullAddress]:[]),...addresses]),city:cities[0]||"",coords:coord?{lat:Number(coord[1].replace(",",".")),lng:Number(coord[2].replace(",","."))}:null,isFood:isBusiness&&business.type==="food"||FOOD.test(raw),raw,rule,business:isBusiness?business:null};
 }
 
 
 // Business-only structured OCR. Landmark rules below are intentionally unchanged.
-const BUSINESS_TYPES={brand:/\b(aldi|lidl|biedronka|zabka|żabka|carrefour|kaufland|auchan)\b/i,food:/\b(kebab|cafe|café|coffee|restauracja|restaurant|bar|bistro|pizza|sushi|burger|ramen|cake|cukiernia|piekarnia|herbaciarnia|tea)\b/i};
-const BUSINESS_ALIAS=[[/\b(?:ald1|aldl|aidi|aldi)\b/i,"ALDI"],[/\b(?:l1dl|lid1|lidl)\b/i,"LIDL"],[/\bbubb?ella\b/i,"Bubbella"],[/\brost\s*kebab\b/i,"Rost Kebab"],[/\bfit\s*cake\b/i,"Fit Cake"],[/\bhong\s*ha\b/i,"Hong Ha"]];
-const BUSINESS_UI=/(google|maps|instagram|facebook|reklama|реклама|обзор|отзывы|информация|маршрут|сохранить|поделиться|подписаться|открыто|закрыто|open now|closed|телефон|website|photos?|menu|доставка|самовывоз|владелец|история карт)/i;
-function normalizeBusinessName(line){const cleaned=clean(line).replace(/^[^\p{L}\d]+|[^\p{L}\d)]+$/gu,"").trim();for(const [re,name] of BUSINESS_ALIAS)if(re.test(cleaned))return name;return cleaned}
-function splitBusinessAddress(line){const postcode=(line.match(/\b\d{2}-\d{3}\b/)||[])[0]||"",city=normalizeCity(line)||clean(line.match(/\b\d{2}-\d{3}\s+([\p{L} .'-]{2,40})/u)?.[1]||"").replace(/[,.;].*$/," ").trim(),street=clean(line.replace(/\b\d{2}-\d{3}\b/g,"").replace(city,"").replace(/^[,; ]+|[,; ]+$/g,""));return{street,postcode,city}}
-function isBusinessTitle(line){if(!line||line.length<2||line.length>70||BUSINESS_UI.test(line)||NAV_UI.test(line)||CATEGORY.test(line)||looksLikeAddress(line))return false;if(/https?:|\b\d{2}-\d{3}\b|\d+\s*(zł|pln|€|\$)|\(?\d[\d\s]{5,}\)?/i.test(line))return false;return(line.match(/[\p{L}]/gu)||[]).length>=2}
-function extractBusinessStructure(raw,lines,rule){const cleanLines=lines.map(clean).filter(Boolean);let name="";for(const line of cleanLines){if(BUSINESS_ALIAS.some(([re])=>re.test(line))){name=normalizeBusinessName(line);break}}if(!name){const candidates=cleanLines.map((line,index)=>({line:normalizeBusinessName(line),score:(isBusinessTitle(line)?40:0)+(index<12?18:0)+(BUSINESS_TYPES.food.test(line)?20:0)})).filter(x=>x.score>35).sort((a,b)=>b.score-a.score);name=candidates[0]?.line||""}let street="",postcode="",city="";const postalIndex=cleanLines.findIndex(x=>/\b\d{2}-\d{3}\b/.test(x));if(postalIndex>=0){const p=splitBusinessAddress([cleanLines[postalIndex-1],cleanLines[postalIndex]].filter(Boolean).join(", "));street=p.street;postcode=p.postcode;city=p.city}const addressLine=cleanLines.find(x=>looksLikeAddress(x)&&!BUSINESS_UI.test(x));if(addressLine){const p=splitBusinessAddress(addressLine);street=p.street||street;postcode=p.postcode||postcode;city=p.city||city}if(!city)city=cleanLines.map(normalizeCity).find(Boolean)||rule?.city||"";const fullAddress=[street,[postcode,city].filter(Boolean).join(" ")].filter(Boolean).join(", "),type=BUSINESS_TYPES.brand.test(norm(name))||rule?.kind==="brand"?"brand":(BUSINESS_TYPES.food.test(`${name} ${raw}`)||rule?.kind==="food"?"food":"");return{name,street,postcode,city,fullAddress,type,complete:Boolean(name&&(street||postcode))}}
-
+const BUSINESS_TYPES={
+  brand:/\b(aldi|lidl|biedronka|zabka|żabka|carrefour|kaufland|auchan|netto|dino|intermarche|leclerc)\b/i,
+  food:/\b(kebab|cafe|café|coffee|restauracja|restaurant|bar|bistro|pizza|sushi|burger|ramen|cake|cukiernia|piekarnia|herbaciarnia|tea|roll|grill)\b/i,
+  lodging:/\b(villa|willa|hotel|pałac|palac|resort|apartament|hostel|pensjonat|marina)\b/i,
+  airport:/\b(lotnisko|airport|port lotniczy)\b/i,
+  service:/\b(kajaki|kayak|wypożyczalnia|rental|farma|alpaka|alpaki|salon|studio|centrum)\b/i
+};
+const BUSINESS_ALIAS=[
+  [/\b(?:ald1|aldl|aidi|aldi)\b/i,"ALDI"],
+  [/\b(?:l1dl|lid1|lidl)\b/i,"LIDL"],
+  [/\bbubb?ella\b/i,"Bubbella"],
+  [/\brost\s*kebab\b/i,"Rost Kebab"],
+  [/\bfit\s*cake\b/i,"Fit Cake"],
+  [/\bhong\s*ha\b/i,"Hong Ha"]
+];
+const BUSINESS_UI=/(google|maps|instagram|facebook|reklama|реклама|обзор|отзывы|информация|маршрут|сохранить|поделиться|подписаться|открыто|закрыто|open now|closed|телефон|website|photos?|menu|доставка|самовывоз|владелец|история карт|похожие места|предложить изменение)/i;
+const BUSINESS_CATEGORY_LINE=/^(?:supermarket|supemarket|sklep|market|restauracja|restaurant|kawiarnia|cafe|caf|kebab|hotel|willa|villa|port lotniczy|mi8dzynarodowy port lotniczy|wypocyczalnia kajakw|atrakcja turystyczna)$/i;
+const STREET_PREFIX=/^(?:ul\.?|ulica|aleja|al\.?|plac|pl\.?|rondo|osiedle|os\.?|street|road|avenue)\s+/i;
+function normalizeBusinessName(line){
+  const cleaned=clean(line).replace(/^[^\p{L}\d]+|[^\p{L}\d)]+$/gu,"").trim();
+  for(const [re,name] of BUSINESS_ALIAS)if(re.test(cleaned))return name;
+  return cleaned;
+}
+function normalizeHouse(value){return norm(value).replace(/\s/g,"").replace(/lok\.?|unit|apt\.?/g,"/")}
+function normalizeStreet(value){return norm(value).replace(STREET_PREFIX,"").replace(/\b(?:polska|poland)\b/g,"").replace(/\s+/g," ").trim()}
+function cityFromLine(line){
+  const known=normalizeCity(line); if(known)return known;
+  const m=clean(line).match(/\b\d{2}-\d{3}\s+([\p{L} .'-]{2,45})/u);
+  return m?m[1].replace(/[,.;].*$/,"").trim():"";
+}
+function parseAddressParts(value){
+  const raw=clean(value),postcode=(raw.match(/\b\d{2}-\d{3}\b/)||[])[0]||"",city=cityFromLine(raw);
+  let body=raw.replace(/\b\d{2}-\d{3}\b/g," ").replace(new RegExp(city.replace(/[.*+?^${}()|[\]\\]/g,"\\$&"),"i")," ").replace(/\b(?:Polska|Poland)\b/ig," ").replace(/[,;]+/g," ").replace(/\s+/g," ").trim();
+  const hm=body.match(/(.+?)\s+(\d+[A-Za-z]?(?:\s*\/\s*[A-Za-z0-9]+)?)(?:\s|$)/u);
+  const street=hm?hm[1].replace(STREET_PREFIX,"").trim():body.replace(STREET_PREFIX,"").trim();
+  const house=hm?hm[2].replace(/\s/g,""):"";
+  return{street,house,postcode,city,fullAddress:[[street,house].filter(Boolean).join(" "),[postcode,city].filter(Boolean).join(" ")].filter(Boolean).join(", ")};
+}
+function isBusinessTitle(line){
+  if(!line||line.length<2||line.length>78||BUSINESS_UI.test(line)||NAV_UI.test(line)||CATEGORY.test(line)||BUSINESS_CATEGORY_LINE.test(line)||looksLikeAddress(line))return false;
+  if(/https?:|\b\d{2}-\d{3}\b|\d+\s*(zł|pln|€|\$)|\(?\d[\d\s]{5,}\)?/i.test(line))return false;
+  return(line.match(/[\p{L}]/gu)||[]).length>=2;
+}
+function inferBusinessType(name,raw,rule){
+  if(rule?.kind&&rule.kind!=="landmark"&&rule.kind!=="group")return rule.kind;
+  const value=`${name} ${raw}`;
+  for(const [type,re] of Object.entries(BUSINESS_TYPES))if(re.test(value))return type;
+  return"other";
+}
+function addressWindows(lines){
+  const out=[];
+  for(let i=0;i<lines.length;i++)for(let size=1;size<=3;size++){
+    const group=lines.slice(i,i+size).join(", ");
+    if(looksLikeAddress(group)||/\b\d{2}-\d{3}\b/.test(group))out.push(group);
+  }
+  return uniq(out);
+}
+function extractBusinessStructure(raw,lines,rule){
+  const cleanLines=lines.map(clean).filter(Boolean);
+  let name="";
+  for(const line of cleanLines){if(BUSINESS_ALIAS.some(([re])=>re.test(line))){name=normalizeBusinessName(line);break}}
+  if(!name&&rule&&["brand","food","lodging","airport","service"].includes(rule.kind))name=rule.names?.[0]||"";
+  if(!name){
+    const candidates=cleanLines.map((line,index)=>{const normalized=normalizeBusinessName(line);let score=isBusinessTitle(line)?40:0;if(index<12)score+=18;if(Object.values(BUSINESS_TYPES).some(re=>re.test(line)))score+=18;if(line.split(/\s+/).length<=6)score+=8;return{line:normalized,score}}).filter(x=>x.score>44).sort((a,b)=>b.score-a.score);
+    name=candidates[0]?.line||"";
+  }
+  const parsed=addressWindows(cleanLines).map(value=>parseAddressParts(value)).filter(a=>a.street||a.postcode).map(a=>({...a,street:a.street.replace(/^(?:supermarket|sklep|market|restauracja|kawiarnia|cafe|kebab|hotel|wypocyczalnia kajakw|farma alpak|atrakcja turystyczna)\s+/i,"")}));
+  parsed.sort((a,b)=>{const qa=(Boolean(a.house)*20+Boolean(a.postcode)*10+Boolean(a.city)*8)-(a.street.split(/\s+/).length>4?10:0);const qb=(Boolean(b.house)*20+Boolean(b.postcode)*10+Boolean(b.city)*8)-(b.street.split(/\s+/).length>4?10:0);return qb-qa||a.street.length-b.street.length});
+  const best=parsed[0]||{street:"",house:"",postcode:"",city:"",fullAddress:""};
+  const city=best.city||cleanLines.map(normalizeCity).find(Boolean)||rule?.city||"";
+  const fullAddress=[[best.street,best.house].filter(Boolean).join(" "),[best.postcode,city].filter(Boolean).join(" ")].filter(Boolean).join(", ");
+  const type=inferBusinessType(name,raw,rule);
+  return{name,street:best.street,house:best.house,postcode:best.postcode,city,fullAddress,type,complete:Boolean(name&&(best.street||best.postcode))};
+}
 const FETCH_CACHE=new Map();
 async function fetchJson(url,timeout=10000){if(FETCH_CACHE.has(url))return FETCH_CACHE.get(url);const c=new AbortController(),t=setTimeout(()=>c.abort(),timeout);try{const r=await fetch(url,{signal:c.signal,headers:{"Accept-Language":"pl,en,ru"}});if(!r.ok)return null;const d=await r.json();FETCH_CACHE.set(url,d);return d}catch{return null}finally{clearTimeout(t)}}
 function officialAddress(item){const a=item.address||{};return[[a.road||a.pedestrian||a.square||a.neighbourhood,a.house_number].filter(Boolean).join(" "),[a.postcode,a.city||a.town||a.village||a.municipality].filter(Boolean).join(" ")].filter(Boolean).join(", ")||item.display_name||""}
@@ -70,21 +136,104 @@ export async function reverse(lat,lng){const item=await fetchJson(`https://nomin
 async function photon(query,poland){const p=new URLSearchParams({q:query,lang:"pl",limit:"15"});if(poland)p.append("countrycode","PL");const d=await fetchJson(`https://photon.komoot.io/api/?${p}`);return d?.features||[]}
 async function nominatim(query,poland){const p=new URLSearchParams({format:"jsonv2",limit:"8",addressdetails:"1",namedetails:"1",q:query});if(poland)p.set("countrycodes","pl");return await fetchJson(`https://nominatim.openstreetmap.org/search?${p}`)||[]}
 async function wiki(query,lang){const p=new URLSearchParams({action:"query",generator:"search",gsrsearch:query,gsrlimit:"6",prop:"coordinates|description",format:"json",origin:"*"});const d=await fetchJson(`https://${lang}.wikipedia.org/w/api.php?${p}`);return Object.values(d?.query?.pages||{}).filter(page=>page.coordinates?.[0])}
-function kind(name,rule){if(rule?.kind)return rule.kind;const n=norm(name);if(/aldi|lidl|biedronka|zabka|carrefour|kaufland|auchan/.test(n))return"brand";if(/kebab|cafe|coffee|restaur|bubbella|rost|fit cake/.test(n))return"food";if(/villa|hotel|apart/.test(n))return"lodging";if(/muzeum|museum|barbakan|park|fontann|zamek|palac|pomnik|skit|riese|reserve|rezerwat|citadel|cytadela|morskie oko|czarny staw|dar pomorza/.test(n))return"landmark";return"other"}
+function kind(name,rule){if(rule?.kind)return rule.kind;const business=inferBusinessType(name,name,null);if(business!=="other")return business;const n=norm(name);if(/muzeum|museum|barbakan|park|fontann|zamek|palac|pomnik|skit|riese|reserve|rezerwat|citadel|cytadela|morskie oko|czarny staw|dar pomorza/.test(n))return"landmark";return"other"}
 function resultType(p){return norm([p.osm_value,p.type,p.osm_key].filter(Boolean).join(" "))}
 function compatible(type,target){const t=norm(type);if(target==="lodging"&&/museum|muzeum|memorial/.test(t))return false;if((target==="food"||target==="brand")&&/museum|historic|memorial|monument/.test(t))return false;return true}
 function nameStrength(query,name,address){const base=similarity(query,`${name} ${address}`),keys=keyTokens(query),hay=norm(`${name} ${address}`),required=keys.length?keys.filter(x=>hay.includes(x)||tokens(hay).some(y=>charDice(x,y)>.75)).length/keys.length:base;return Math.max(base,required*.92)}
 function photonCandidate(feature,signals,polandPass){const p=feature.properties||{},c=feature.geometry?.coordinates||[],name=p.name||p.street||signals.names[0]||"Место",address=[[p.street,p.housenumber].filter(Boolean).join(" "),[p.postcode,p.city||p.town||p.village||p.county].filter(Boolean).join(" ")].filter(Boolean).join(", ")||[name,p.city,p.country].filter(Boolean).join(", "),city=p.city||p.town||p.village||p.county||"",nameMatch=Math.max(...signals.names.map(n=>nameStrength(n,name,address)),0),addressMatch=Math.max(0,...signals.addresses.map(a=>similarity(a,address))),cityMatch=signals.city?similarity(signals.city,city):0,country=String(p.countrycode||"").toLowerCase();return{name,address,city,lat:Number(c[1]),lng:Number(c[0]),score:nameMatch*300+addressMatch*250+cityMatch*110+(country==="pl"?45:0)+(polandPass?5:0),country,type:resultType(p),nameMatch,addressMatch}}
 function strictEnough(item,signals,target){if(!Number.isFinite(item.lat)||!Number.isFinite(item.lng)||!compatible(item.type,target))return false;if(signals.city&&item.city&&similarity(signals.city,item.city)<.55)return false;if(target==="brand")return item.nameMatch>=.72&&(signals.addresses.length===0||item.addressMatch>=.48);if(target==="food")return item.nameMatch>=.58||(signals.addresses.length&&item.addressMatch>=.62);const threshold=target==="group"?.35:.48;return item.nameMatch>=threshold||(signals.addresses.length&&item.addressMatch>=.55)}
 
-async function addressFallback(signals,score=245){for(const raw of signals.addresses.slice(0,4)){for(const query of uniq([raw,raw.replace(/\/\w+/g,""),[raw,signals.city].filter(Boolean).join(", ")])){for(const poland of [true,false]){const hits=await nominatim(query,poland);if(hits.length){const h=hits[0],a=h.address||{};return{name:signals.names[0]||officialName(h)||"Место",address:officialAddress(h),city:a.city||a.town||a.village||a.municipality||signals.city||"",lat:Number(h.lat),lng:Number(h.lon),score,country:a.country_code||"",type:"address",nameMatch:1,addressMatch:1}}}}return null}}
-
-
-async function findBusinessCandidates(signals,target){const b=signals.business||{},name=b.name||signals.names[0]||"",address=b.fullAddress||signals.addresses[0]||"",scoped={...signals,names:uniq([name,...signals.names]),addresses:uniq([address,...signals.addresses]),city:b.city||signals.city},addressPoint=address?await addressFallback(scoped,1200):null,queries=uniq([[name,address].filter(Boolean).join(", "),[name,b.city].filter(Boolean).join(", "),name]);let exact=[];for(const poland of[true,false]){const batches=await Promise.all(queries.filter(Boolean).map(q=>photon(q,poland)));exact.push(...batches.flat().map(f=>photonCandidate(f,scoped,poland)).filter(item=>{if(!compatible(item.type,target))return false;if(target==="brand"&&item.nameMatch<.78)return false;if(target==="food"&&item.nameMatch<.62&&item.addressMatch<.72)return false;if(scoped.city&&item.city&&similarity(scoped.city,item.city)<.58)return false;return true}));if(exact.some(x=>x.score>=210))break}if(addressPoint){addressPoint.name=name||addressPoint.name;addressPoint.city=b.city||addressPoint.city;addressPoint.score=1300;addressPoint.type=`${target}-address`;exact.unshift(addressPoint)}return[...new Map(exact.map(item=>[`${item.lat.toFixed(5)}|${item.lng.toFixed(5)}`,item])).values()].sort((a,b)=>b.score-a.score).slice(0,6)}
-
+function candidateAddressParts(item){
+  if(item._addressParts)return item._addressParts;
+  return parseAddressParts(`${item.address||""}, ${item.city||""}`);
+}
+function componentMatch(expected,actual){
+  if(!expected)return 1;
+  if(!actual)return 0;
+  return similarity(expected,actual);
+}
+function addressValidation(expected,item){
+  const actual=candidateAddressParts(item);
+  const street=componentMatch(expected.street,actual.street),city=componentMatch(expected.city,item.city||actual.city);
+  const expectedHouse=normalizeHouse(expected.house),actualHouse=normalizeHouse(actual.house),house=expected.house?(expectedHouse===actualHouse||expectedHouse.split("/")[0]===actualHouse.split("/")[0]):1;
+  const postcode=expected.postcode?norm(expected.postcode)===norm(actual.postcode):1;
+  const hardFail=(expected.house&&!house)||(expected.postcode&&actual.postcode&&!postcode)||(expected.city&&item.city&&city<.55)||(expected.street&&actual.street&&street<.55);
+  const score=(expected.street?street*.42:0)+(expected.house?(house?0.25:0):0)+(expected.postcode?(postcode?0.18:0):0)+(expected.city?city*.15:0);
+  const max=(expected.street?.42:0)+(expected.house?.25:0)+(expected.postcode?.18:0)+(expected.city?.15:0);
+  return{score:max?score/max:0,hardFail,actual};
+}
+function nameValidation(expected,item,target){
+  const candidate=item.name||"";
+  if(target==="brand"){
+    const a=normalizeBusinessName(expected),b=normalizeBusinessName(candidate);
+    return norm(a)===norm(b)||similarity(a,b)>=.9?1:0;
+  }
+  return nameStrength(expected,candidate,item.address||"");
+}
+function polishContext(signals){return /\b(?:polska|poland)\b/i.test(signals.raw||"")||Boolean(signals.business?.postcode)||Boolean(signals.business?.city&&normalizeCity(signals.business.city))}
+function candidateAllowed(item,signals,target){
+  if(!Number.isFinite(item.lat)||!Number.isFinite(item.lng)||!compatible(item.type,target))return false;
+  const b=signals.business||{},expectedName=b.name||signals.names[0]||"",expectedAddress={street:b.street||"",house:b.house||"",postcode:b.postcode||"",city:b.city||signals.city||""};
+  const nm=nameValidation(expectedName,item,target),av=addressValidation(expectedAddress,item);
+  if(av.hardFail)return false;
+  if(polishContext(signals)&&item.country&&String(item.country).toLowerCase()!=="pl")return false;
+  if(target==="brand")return nm===1&&(b.complete?av.score>=.68:true);
+  if(["food","lodging","airport","service"].includes(target)){
+    if(nm>=.66)return !b.complete||av.score>=.45;
+    return b.complete&&av.score>=.88;
+  }
+  return nm>=.58;
+}
+async function validatedAddressFallback(signals,target){
+  const b=signals.business||{},expected={street:b.street||"",house:b.house||"",postcode:b.postcode||"",city:b.city||signals.city||""};
+  if(!expected.street&&!expected.postcode)return null;
+  const queries=uniq([b.fullAddress,...signals.addresses,[[expected.street,expected.house].filter(Boolean).join(" "),[expected.postcode,expected.city].filter(Boolean).join(" ")].filter(Boolean).join(", ")]).filter(Boolean);
+  const candidates=[];
+  for(const query of queries.slice(0,4))for(const poland of[true,false]){
+    const hits=await nominatim(query,poland);
+    for(const h of hits){
+      const a=h.address||{},item={name:b.name||signals.names[0]||officialName(h)||"Место",address:officialAddress(h),city:a.city||a.town||a.village||a.municipality||"",lat:Number(h.lat),lng:Number(h.lon),country:a.country_code||"",type:"address",_addressParts:{street:a.road||a.pedestrian||a.square||a.neighbourhood||"",house:a.house_number||"",postcode:a.postcode||"",city:a.city||a.town||a.village||a.municipality||""}};
+      const validation=addressValidation(expected,item);
+      if(!validation.hardFail&&validation.score>=.84)candidates.push({...item,addressMatch:validation.score,nameMatch:1,score:900+validation.score*100});
+    }
+    if(candidates.length)break;
+  }
+  return candidates.sort((a,b)=>b.score-a.score)[0]||null;
+}
+async function businessSearchSources(query,poland,signals){
+  const out=[];
+  const photonHits=await photon(query,poland);
+  out.push(...photonHits.map(f=>photonCandidate(f,signals,poland)));
+  const nomHits=await nominatim(query,poland);
+  for(const h of nomHits){
+    const a=h.address||{},name=officialName(h)||signals.business?.name||signals.names[0]||"",address=officialAddress(h),city=a.city||a.town||a.village||a.municipality||"";
+    out.push({name,address,city,lat:Number(h.lat),lng:Number(h.lon),country:a.country_code||"",type:h.type||h.class||"",nameMatch:Math.max(...signals.names.map(value=>nameStrength(value,name,address)),0),addressMatch:Math.max(0,...signals.addresses.map(value=>similarity(value,address))),_addressParts:{street:a.road||a.pedestrian||a.square||a.neighbourhood||"",house:a.house_number||"",postcode:a.postcode||"",city},score:0});
+  }
+  return out;
+}
+async function findBusinessCandidates(signals,target){
+  const b=signals.business||{},name=b.name||signals.names[0]||"",scoped={...signals,names:uniq([name,...signals.names]),addresses:uniq([b.fullAddress,...signals.addresses]),city:b.city||signals.city};
+  const queries=uniq([[name,b.fullAddress].filter(Boolean).join(", "),[name,b.city].filter(Boolean).join(", "),name]).filter(Boolean);
+  const accepted=[];
+  for(const poland of[true,false]){
+    for(const query of queries){
+      const hits=await businessSearchSources(query,poland,scoped);
+      for(const item of hits)if(candidateAllowed(item,scoped,target)){
+        const av=addressValidation({street:b.street||"",house:b.house||"",postcode:b.postcode||"",city:b.city||scoped.city||""},item),nm=nameValidation(name,item,target);
+        item.nameMatch=nm;item.addressMatch=av.score;item.score=nm*520+av.score*420+(String(item.country||"").toLowerCase()==="pl"?35:0);
+        accepted.push(item);
+      }
+    }
+    if(accepted.length)break;
+  }
+  const fallback=await validatedAddressFallback(scoped,target);
+  if(fallback){fallback.name=name||fallback.name;fallback.type=`${target}-address`;accepted.push(fallback)}
+  const unique=[...new Map(accepted.map(item=>[`${item.lat.toFixed(5)}|${item.lng.toFixed(5)}`,item])).values()].sort((a,b)=>b.score-a.score);
+  return unique.slice(0,6);
+}
 export async function findCandidates(signals){
   if(signals.coords){const r=await reverse(signals.coords.lat,signals.coords.lng).catch(()=>({address:"",city:signals.city}));return[{name:signals.names[0]||"Место",address:r.address,city:r.city,lat:signals.coords.lat,lng:signals.coords.lng,score:999,country:"",type:"coordinates",nameMatch:1,addressMatch:1}]}
-  const target=signals.business?.type||kind(signals.names[0]||"",signals.rule),names=uniq([...(signals.rule?.names||[]),...signals.names]).slice(0,target==="group"?7:5),business=target==="brand"||target==="food";
+  const target=signals.business?.type||kind(signals.names[0]||"",signals.rule),names=uniq([...(signals.rule?.names||[]),...signals.names]).slice(0,target==="group"?7:5),business=["brand","food","lodging","airport","service"].includes(target);
   if(business)return findBusinessCandidates({...signals,names},target);
   const businessAddress=null;
   const queries=uniq(names.flatMap(name=>[[name,signals.city].filter(Boolean).join(", "),signals.addresses[0]?[name,signals.addresses[0]].join(", "):"",name])).filter(Boolean);
