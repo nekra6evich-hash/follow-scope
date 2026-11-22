@@ -15,31 +15,57 @@ const seed=[
 async function imageBlob(file,max=1300){const b=await createImageBitmap(file),scale=Math.min(1,max/b.width),c=document.createElement("canvas");c.width=Math.round(b.width*scale);c.height=Math.round(b.height*scale);const x=c.getContext("2d");x.filter="contrast(1.15) saturate(.35)";x.drawImage(b,0,0,c.width,c.height);b.close();return new Promise(r=>c.toBlob(r,"image/jpeg",.88))}
 async function preview(file){const b=await createImageBitmap(file),s=Math.min(1,480/b.width),c=document.createElement("canvas");c.width=Math.round(b.width*s);c.height=Math.round(b.height*s);c.getContext("2d").drawImage(b,0,0,c.width,c.height);b.close();return c.toDataURL("image/jpeg",.58)}
 
-function blockAwareOCRText(data){
- const raw=String(data?.text||"").trim(),blocks=Array.isArray(data?.blocks)?data.blocks:[];
- if(!blocks.length)return raw;
- const rows=[];
- for(const block of blocks){
-  const box=block?.bbox||{};
-  const height=Math.max(1,Number(box.y1||0)-Number(box.y0||0));
-  const confidence=Number(block?.confidence??block?.conf??0);
-  for(const part of String(block?.text||"").split(/\n+/)){
-   const text=part.replace(/\s+/g," ").trim();
-   if(text)rows.push({text,x:Number(box.x0||0),y:Number(box.y0||0),height,confidence});
+function tsvAwareOCRText(data){
+ const fallback=String(data?.text||"").trim(),tsv=String(data?.tsv||"");
+ if(!tsv)return fallback;
+ const words=[];
+ for(const row of tsv.split(/\r?\n/).slice(1)){
+  const p=row.split("\t");if(p.length<12||p[0]!=="5"||!p[11]?.trim())continue;
+  words.push({key:p.slice(1,5).join(":"),x:Number(p[6]),y:Number(p[7]),w:Number(p[8]),h:Number(p[9]),confidence:Number(p[10]),text:p[11].trim()});
+ }
+ const groups=new Map();for(const word of words)groups.set(word.key,[...(groups.get(word.key)||[]),word]);
+ const lines=[...groups.values()].map(items=>{items.sort((a,b)=>a.x-b.x);return{text:items.map(x=>x.text).join(" ").replace(/\s+/g," ").trim(),x:Math.min(...items.map(x=>x.x)),y:Math.min(...items.map(x=>x.y)),h:Math.max(...items.map(x=>x.h)),confidence:items.reduce((s,x)=>s+Math.max(0,x.confidence),0)/items.length}}).sort((a,b)=>a.y-b.y||a.x-b.x);
+ const noise=/(отправить|избранное|изменить|удалить|ещ[её]|подписа|публикац|подписчик|подписки|отзывы|фото|о месте|обзор|информац|проложить|маршрут|сохранить|поделиться|показать перевод|недавно просмотр|похожие места|гостиницы поблизости|музеи поблизости|закрыто|откроется|сообщение|контакты|booking|реклама|followers|following|wolt\.com|полезные советы|\bмин\b|\bчас\b|дня назад)/i;
+ const type=/(hotel|отель|гостиниц|villa|willa|marina|muzeum|museum|zamek|skit|projekt|rezerwat|reserve|park|lotnisko|airport|ko[śs]ci[oó][łl]|кост[её]л|farma|alpaki|kajaki|kebab|cafe|restaur|bistro|aldi|lidl|rollza)/i;
+ const date=/(^|\s)(?:\d{1,2}[:.]\d{2}|\d{1,2}\s+(?:октября|ноября|июня|мая)|20\d{2}\s*г|\d+[,.]\d\s*[★*])/i;
+ const postcode=/\b\d{2}-\d{3}\b/;
+ const normalize=value=>String(value||"").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/[^\p{L}\d]+/gu," ").trim();
+ const clean=value=>String(value||"").replace(/^[^\p{L}\d]+/u,"").replace(/\s+[•*;>]+\s*.*$/,"").replace(/^\p{Lu}\s+(?=\p{Lu}\p{Ll})/u,"").trim();
+ const variants=[];
+ for(let i=0;i<lines.length;i++){
+  variants.push({text:lines[i].text,line:lines[i]});let merged=lines[i].text,conf=[lines[i].confidence];
+  for(let j=i+1;j<Math.min(i+3,lines.length);j++){
+   const prev=lines[j-1],next=lines[j];if(next.y-(prev.y+prev.h)<=0||next.y-(prev.y+prev.h)>=55||Math.abs(next.x-lines[i].x)>=180)break;
+   merged+=` ${next.text}`;conf.push(next.confidence);variants.push({text:merged,line:{...lines[i],h:Math.max(lines[i].h,next.h),confidence:conf.reduce((s,x)=>s+x,0)/conf.length}});
   }
  }
- if(!rows.length)return raw;
- rows.sort((a,b)=>a.y-b.y||a.x-b.x);
- const heights=rows.map(r=>r.height).sort((a,b)=>a-b),median=heights[Math.floor(heights.length/2)]||1;
- const ui=/(^|\s)(overview|reviews?|photos?|menu|route|save|share|tickets?|information|обзор|отзывы|фото|билеты|информация|маршрут|сохранить|поделиться|polubie[nń]|likes?|followers?|following|комментар|просмотр)(\s|$)/i;
- const address=/\b\d{2}-\d{3}\b|(?:ul\.?|aleja|al\.?|plac|pl\.?|street|st\.?|road|rd\.?|улица|ул\.?)\s+[\p{L}][\p{L} .'-]{1,45}\s+\d+[\w/-]*/iu;
- const category=/^(supermarket|hotel|restaurant|restauracja|cafe|kawiarnia|kebab|museum|muzeum|park|airport|lotnisko|historic|исторический памятник|супермаркет|кафе|ресторан)$/i;
- const useful=rows.filter(r=>r.text.length>=2&&!ui.test(r.text));
- const title=useful.filter(r=>!address.test(r.text)&&!category.test(r.text)&&!/^\d+[.,]?\d*\s*(zł|pln|€|\$)$/i.test(r.text)).map(r=>({...r,score:(r.height/median)*28+Math.min(r.confidence,100)*.25+(r.text.length<=45?18:0)+(r.text.split(/\s+/).length<=6?12:0)})).sort((a,b)=>b.score-a.score).slice(0,5);
- const addr=useful.filter(r=>address.test(r.text)).sort((a,b)=>b.confidence-a.confidence).slice(0,5);
- const priority=[];for(const r of [...title,...addr])if(!priority.some(x=>x.toLowerCase()===r.text.toLowerCase()))priority.push(r.text);
- const ordered=[];for(const r of useful)if(!ordered.some(x=>x.toLowerCase()===r.text.toLowerCase()))ordered.push(r.text);
- return [...priority,...ordered].join("\n");
+ const candidates=[];
+ for(const variant of variants){
+  const source=clean(variant.text),extras=[];
+  const typed=source.match(new RegExp(`${type.source}\\b.*`,"i"));if(typed)extras.push(typed[0]);
+  const afterTo=source.match(/\bto\s+([A-Z][\w-]{2,}(?:\s+[A-Z][\w-]{2,}){0,3})/);if(afterTo)extras.push(afterTo[1]);
+  for(let value of [source,...extras]){
+   value=value.replace(/\s+[\d()★*]+(?:\s+\w{0,2})?$/,"").replace(/^[\s–—•|-]+|[\s–—•|-]+$/g,"").trim();
+   if(value.length<3||value.length>100||noise.test(value)||date.test(value)||postcode.test(value))continue;
+   const letters=[...value].filter(c=>/\p{L}/u.test(c)).length,digits=[...value].filter(c=>/\d/.test(c)).length,parts=value.split(/\s+/);if(letters<3||digits>letters)continue;
+   const capitals=parts.filter(w=>/^\p{Lu}/u.test(w)&&/\p{L}/u.test(w)).length;
+   let score=variant.line.confidence*.45+Math.min(variant.line.h,70)*.5+(type.test(value)?95:0)+Math.min(35,capitals*10)-(parts.length>8?45:0);
+   candidates.push({value,normalized:normalize(value),score});
+  }
+ }
+ for(const a of candidates)for(const b of candidates)if(a!==b&&a.normalized.length>=4&&(a.normalized.includes(b.normalized)||b.normalized.includes(a.normalized)))a.score+=22;
+ const names=[],nameSeen=new Set();for(const item of candidates.sort((a,b)=>b.score-a.score)){if(!nameSeen.has(item.normalized)){nameSeen.add(item.normalized);names.push(item.value)}if(names.length>=8)break}
+ const addresses=[];
+ for(let index=0;index<lines.length;index++){
+  const line=clean(lines[index].text),pc=line.match(postcode);if(!pc)continue;
+  const before=line.slice(0,pc.index).replace(/\b(?:Polska|Poland)\b/ig," ").trim(),after=line.slice(pc.index+pc[0].length).trim(),parts=before.split(",").map(x=>x.trim()).filter(Boolean);
+  let street=[...parts].reverse().find(x=>/\d/.test(x))||before;street=street.replace(/^.*?(?=(?:ul\.?|aleja|al\.?|plac|\p{Lu}[\p{L}.-]+)\s+\d)/u,"").trim();
+  let city=after.split(/\s+/)[0]||"";const partIndex=parts.indexOf(street);if(partIndex>=0&&partIndex+1<parts.length)city=parts[partIndex+1];
+  if(!city&&lines[index+1]&&/^\p{Lu}[\p{L} -]{2,40}$/u.test(clean(lines[index+1].text)))city=clean(lines[index+1].text);
+  if(/\b\d+[A-Za-z]?(?:[/-][A-Za-z0-9]+)?\b/.test(street)&&!date.test(street))addresses.push(`${street}, ${pc[0]} ${city}`.trim());
+ }
+ const allLines=[];for(const line of lines){const value=clean(line.text);if(value&&!allLines.some(x=>normalize(x)===normalize(value)))allLines.push(value)}
+ return [...names,...addresses,...allLines].join("\n")||fallback;
 }
 
 function pinIcon(status,isFood){const color=isFood?"#f28c28":status==="visited"?"#139c7d":"#4778ee";return L.divIcon({className:"",html:`<div style="width:29px;height:29px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);background:${color};border:3px solid white;box-shadow:0 5px 13px #0005"><i style="display:block;width:8px;height:8px;border-radius:50%;background:white;margin:7px"></i></div>`,iconSize:[29,39],iconAnchor:[15,37]})}
@@ -56,7 +82,7 @@ export default function App(){
  const pal=dark?{app:"#090b16",chrome:"#111421",panel:"#151927",glass:"#151927f5",text:"#f7f8ff",muted:"#aab0c2",line:"#ffffff1a",soft:"#ffffff12"}:{app:"#eef1f7",chrome:"#fff",panel:"#fff",glass:"#fffffff5",text:"#182033",muted:"#667085",line:"#252f481c",soft:"#f2f4f8"};
  const closeAll=()=>{setEditOpen(false);setAddOpen(false);setManualOpen(false);setCandidateOpen(false)},switchTab=t=>{closeAll();setSelected(null);setTab(t)},openEdit=p=>{setSelected(p);setEdit({...p});setEditOpen(true)},saveEdit=()=>{setPlaces(a=>a.map(p=>p.id===selected.id?{...p,...edit}:p));setSelected({...selected,...edit});setEditOpen(false)},del=id=>{setPlaces(a=>a.filter(p=>p.id!==id));if(selected?.id===id)setSelected(null)};
  const choose=c=>{const p={id:Date.now(),name:c.name,address:c.address,city:c.city,note:"",status:pending.status||"want",isFood:pending.isFood,lat:c.lat,lng:c.lng,screenshot:pending.screenshot};setPlaces(a=>[...a,p]);setSelected(p);setCandidateOpen(false);setTab("map")};
- const processImage=async e=>{const file=e.target.files?.[0];if(!file)return;setProcessing(true);setError("");setProgress(0);try{setStage("Считываю скриншот");const pv=await preview(file),img=await imageBlob(file);const worker=await createWorker(["eng","pol","rus"],undefined,{logger:m=>m.status==="recognizing text"&&setProgress(Math.round((m.progress||0)*100))});let r;try{r=await worker.recognize(img,{}, {text:true,blocks:true})}finally{await worker.terminate()}const sig=extractSignals(blockAwareOCRText(r.data));if(!sig.names.length&&!sig.addresses.length&&!sig.coords)throw Error("Не удалось распознать название, адрес или координаты");setStage("Ищу место: сначала в Польше");const list=await findCandidates(sig);if(!list.length)throw Error("По распознанному названию и адресу место не найдено");setPending({screenshot:pv,isFood:sig.isFood,status:"want"});setCandidates(list);setCandidateOpen(true);setAddOpen(false)}catch(x){setError(x.message||"Ошибка распознавания")}finally{setProcessing(false);e.target.value=""}};
+ const processImage=async e=>{const file=e.target.files?.[0];if(!file)return;setProcessing(true);setError("");setProgress(0);try{setStage("Считываю скриншот");const pv=await preview(file),img=await imageBlob(file);const worker=await createWorker(["eng","pol","rus"],undefined,{logger:m=>m.status==="recognizing text"&&setProgress(Math.round((m.progress||0)*100))});let r;try{r=await worker.recognize(img,{}, {text:true,tsv:true})}finally{await worker.terminate()}const sig=extractSignals(tsvAwareOCRText(r.data));if(!sig.names.length&&!sig.addresses.length&&!sig.coords)throw Error("Не удалось распознать название, адрес или координаты");setStage("Ищу место: сначала в Польше");const list=await findCandidates(sig);if(!list.length)throw Error("По распознанному названию и адресу место не найдено");setPending({screenshot:pv,isFood:sig.isFood,status:"want"});setCandidates(list);setCandidateOpen(true);setAddOpen(false)}catch(x){setError(x.message||"Ошибка распознавания")}finally{setProcessing(false);e.target.value=""}};
  const longPress=async ll=>{setManual({name:"",address:"",note:"",status:"want",isFood:false,lat:ll.lat,lng:ll.lng});setManualOpen(true);try{const r=await reverse(ll.lat,ll.lng);setManual(m=>({...m,address:r.address,city:r.city}))}catch{}},saveManual=()=>{if(!manual.name.trim())return;const p={...manual,id:Date.now()};setPlaces(a=>[...a,p]);setSelected(p);setManualOpen(false)},locate=()=>navigator.geolocation?.getCurrentPosition(({coords})=>{setSelected(null);mapRef.current?.flyTo([coords.latitude,coords.longitude],16)});
  const route=()=>selected&&window.open(`https://www.google.com/maps/dir/?api=1&destination=${selected.lat},${selected.lng}`,"_blank"),exportData=()=>{const b=new Blob([JSON.stringify({places},null,2)],{type:"application/json"}),u=URL.createObjectURL(b),a=document.createElement("a");a.href=u;a.download="places.json";a.click();URL.revokeObjectURL(u)},importData=async e=>{try{const x=JSON.parse(await e.target.files[0].text()),a=Array.isArray(x)?x:x.places;if(Array.isArray(a))setPlaces(a)}catch{}e.target.value=""};
  const Chip=({on,click,children})=><button onClick={click} className="h-9 whitespace-nowrap rounded-xl px-3 text-sm font-semibold" style={on?{background:gradient,color:"white"}:{background:pal.soft,color:pal.muted}}>{children}</button>,hidden=editOpen||addOpen||manualOpen||candidateOpen;
